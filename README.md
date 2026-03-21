@@ -49,6 +49,12 @@ LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 ```
 
+如需在 Lighter WebSocket 新旧逻辑切换期间临时强制使用旧的应用层 ping/pong 逻辑，可额外设置：
+```bash
+LIGHTER_WS_SERVER_PINGS=true
+```
+不设置时默认使用新的兼容模式：客户端依赖 WebSocket protocol ping frame 保活，同时仍兼容旧服务端发出的 `ping` 消息。
+
 ### 加载 Chrome 插件
 1. 打开 `chrome://extensions`
 2. 在右上角开启 `Developer mode`
@@ -129,6 +135,12 @@ LIGHTER_ACCOUNT_INDEX=...
 LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 ```
+
+If you need to temporarily force Lighter's legacy application-level ping/pong behavior during the rollout window, you can also set:
+```bash
+LIGHTER_WS_SERVER_PINGS=true
+```
+When unset, the runtime uses the forward-compatible path: it keeps the socket alive with WebSocket protocol ping frames and still responds to legacy server `ping` messages.
 
 ### Load Chrome Extension
 1. Open `chrome://extensions`

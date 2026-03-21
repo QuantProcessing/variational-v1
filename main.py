@@ -50,6 +50,9 @@ DASHBOARD_REFRESH_SECONDS = 1.0
 DASHBOARD_ORDERS = 8
 SPREAD_HISTORY_SECONDS = 3600.0
 ASSET_SWITCH_CONFIRM_TICKS = 3
+LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
+LIGHTER_WS_PING_INTERVAL_SECONDS = 30
+LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 
 
 def utc_now() -> str:
@@ -93,6 +96,11 @@ def required_int_env(name: str) -> int:
         return int(value)
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer, got: {value}") from exc
+
+
+def env_flag(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def spread_value(aggressive_buy_ask: Decimal | None, aggressive_sell_bid: Decimal | None) -> Decimal | None:
@@ -471,12 +479,21 @@ class VariationalToLighterRuntime:
 
         await self.append_order_log("lighter_fill", payload)
 
+    def build_lighter_ws_url(self) -> str:
+        if env_flag("LIGHTER_WS_SERVER_PINGS"):
+            return f"{LIGHTER_WS_URL}?server_pings=true"
+        return LIGHTER_WS_URL
+
     async def handle_lighter_ws(self) -> None:
-        url = "wss://mainnet.zklighter.elliot.ai/stream"
         while not self.stop_flag:
             try:
                 await self.reset_lighter_order_book()
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                url = self.build_lighter_ws_url()
+                async with websockets.connect(
+                    url,
+                    ping_interval=LIGHTER_WS_PING_INTERVAL_SECONDS,
+                    ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
+                ) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
                     account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
@@ -503,7 +520,7 @@ class VariationalToLighterRuntime:
                         self.logger.warning("Error creating Lighter WS auth token: %s", exc)
 
                     while not self.stop_flag:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=20)
+                        raw = await ws.recv()
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8", errors="replace")
                         data = json.loads(raw)
@@ -568,7 +585,11 @@ class VariationalToLighterRuntime:
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                self.logger.warning("Lighter websocket reconnect after error: %s", exc)
+                self.logger.warning(
+                    "Lighter websocket reconnect after error: %s (url=%s)",
+                    exc,
+                    self.build_lighter_ws_url(),
+                )
                 await asyncio.sleep(1)
 
     async def get_lighter_best_bid_ask(self) -> tuple[Decimal | None, Decimal | None]:
