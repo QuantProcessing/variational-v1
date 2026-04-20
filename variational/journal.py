@@ -67,23 +67,32 @@ class EventJournal:
     async def _drain_forever(self) -> None:
         assert self._queue is not None
         batch: list[dict[str, Any]] = []
-        deadline = time.monotonic() + (self.batch_ms / 1000.0)
-        while not (self._stop and self._queue.empty() and not batch):
-            timeout = max(0.0, deadline - time.monotonic())
-            try:
-                event = await asyncio.wait_for(self._queue.get(), timeout=timeout) if timeout > 0 else self._queue.get_nowait()
-                batch.append(event)
-            except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                pass
-
-            now = time.monotonic()
-            if batch and (len(batch) >= self.batch_size or now >= deadline or self._stop):
-                await self._flush(batch)
-                batch = []
-                deadline = now + (self.batch_ms / 1000.0)
-
+        batch_timeout = self.batch_ms / 1000.0
+        last_flush = time.monotonic()
+        while True:
             if self._stop and self._queue.empty() and not batch:
                 return
+            # Always await with a floor so we yield to the loop; never busy-spin.
+            if batch:
+                remaining = batch_timeout - (time.monotonic() - last_flush)
+                wait = max(0.001, remaining)
+            else:
+                wait = batch_timeout
+            try:
+                event = await asyncio.wait_for(self._queue.get(), timeout=wait)
+                batch.append(event)
+            except asyncio.TimeoutError:
+                pass
+
+            should_flush = bool(batch) and (
+                len(batch) >= self.batch_size
+                or (time.monotonic() - last_flush) >= batch_timeout
+                or self._stop
+            )
+            if should_flush:
+                await self._flush(batch)
+                batch = []
+                last_flush = time.monotonic()
 
     async def _flush(self, batch: list[dict[str, Any]]) -> None:
         lines = "".join(json.dumps(ev, ensure_ascii=True, default=str) + "\n" for ev in batch)
