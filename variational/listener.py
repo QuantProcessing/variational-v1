@@ -501,10 +501,10 @@ class CommandBroker:
                     await self._send(
                         requester,
                         {
-                            "type": "ORDER_RESULT",
+                            "type": "FETCH_RESULT",
                             "requestId": request_id,
                             "ok": False,
-                            "error": "Extension disconnected before order result.",
+                            "error": "extension_disconnected",
                             "timestamp": utc_now(),
                         },
                     )
@@ -550,11 +550,11 @@ class CommandBroker:
         if msg_type == "PING":
             await self._send(websocket, {"type": "PONG", "timestamp": utc_now()})
             return
-        if msg_type == "PLACE_ORDER":
-            await self._handle_place_order(websocket, payload)
+        if msg_type == "EXECUTE_FETCH":
+            await self._handle_execute_fetch(websocket, payload)
             return
-        if msg_type == "ORDER_RESULT":
-            await self._handle_order_result(payload)
+        if msg_type == "FETCH_RESULT":
+            await self._handle_fetch_result(payload)
             return
 
         await self._send(
@@ -586,34 +586,17 @@ class CommandBroker:
         if not self.quiet:
             print(f"[COMMAND] registered role={role}", flush=True)
 
-    async def _handle_place_order(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
+    async def _handle_execute_fetch(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("requestId") or uuid.uuid4())
-        side = str(payload.get("side", "")).upper()
-        amount = str(payload.get("amount", "")).strip()
-
-        if side not in {"BUY", "SELL"}:
+        fetch = payload.get("fetch")
+        if not isinstance(fetch, dict) or not fetch.get("url"):
             await self._send(
                 websocket,
                 {
-                    "type": "ORDER_RESULT",
+                    "type": "FETCH_RESULT",
                     "requestId": request_id,
                     "ok": False,
-                    "error": "Invalid side. Use BUY or SELL.",
-                    "timestamp": utc_now(),
-                },
-            )
-            return
-        try:
-            if float(amount) <= 0:
-                raise ValueError
-        except ValueError:
-            await self._send(
-                websocket,
-                {
-                    "type": "ORDER_RESULT",
-                    "requestId": request_id,
-                    "ok": False,
-                    "error": "Invalid amount. Must be positive.",
+                    "error": "fetch.url is required.",
                     "timestamp": utc_now(),
                 },
             )
@@ -625,10 +608,10 @@ class CommandBroker:
                 await self._send(
                     websocket,
                     {
-                        "type": "ORDER_RESULT",
+                        "type": "FETCH_RESULT",
                         "requestId": request_id,
                         "ok": False,
-                        "error": "No extension command client connected.",
+                        "error": "no_attached_extension",
                         "timestamp": utc_now(),
                     },
                 )
@@ -636,28 +619,20 @@ class CommandBroker:
 
             self._pending_requests[request_id] = websocket
             forward_payload = {
-                "type": "PLACE_ORDER",
+                "type": "EXECUTE_FETCH",
                 "requestId": request_id,
-                "side": side,
-                "amount": amount,
-                "market": payload.get("market"),
-                "account": payload.get("account"),
-                "timeoutMs": payload.get("timeoutMs"),
+                "fetch": {
+                    "url": fetch.get("url"),
+                    "method": fetch.get("method", "GET"),
+                    "headers": fetch.get("headers") or {},
+                    "body": fetch.get("body"),
+                },
+                "timeoutMs": int(payload.get("timeoutMs") or 5000),
                 "timestamp": utc_now(),
             }
             await self._send(extension, forward_payload)
 
-        await self._send(
-            websocket,
-            {
-                "type": "ORDER_DISPATCHED",
-                "requestId": request_id,
-                "ok": True,
-                "timestamp": utc_now(),
-            },
-        )
-
-    async def _handle_order_result(self, payload: dict[str, Any]) -> None:
+    async def _handle_fetch_result(self, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("requestId", "")).strip()
         if not request_id:
             return
@@ -667,7 +642,7 @@ class CommandBroker:
         if requester is not None:
             await self._send(requester, payload)
             if not self.quiet:
-                print(f"[COMMAND] order_result requestId={request_id} ok={payload.get('ok')}", flush=True)
+                print(f"[COMMAND] fetch_result requestId={request_id} ok={payload.get('ok')}", flush=True)
 
     async def _send(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
         try:
