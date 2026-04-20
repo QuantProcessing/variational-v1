@@ -12,13 +12,15 @@ source env/bin/activate
 pip install -r requirements.txt
 ```
 
-Run the main runtime (dashboard + auto-hedge, Chinese dashboard by default):
+Run the main runtime (auto-trade, Chinese dashboard):
 
 ```bash
-python main.py               # auto-hedge enabled (default)
-python main.py --no-hedge    # dashboard-only, no Lighter orders
-python main.py --lang en     # English dashboard
+python main.py --qty 0.01                  # required; units = base asset
+python main.py --qty 0.01 --lang en        # English dashboard
+python main.py --qty 0.01 --signal-strict  # stricter green gate: max of medians instead of any
 ```
+
+`--qty` is required. Other flags default to safe values; see `python main.py --help` or the design spec. There is no longer a `--no-hedge` flag — send SIGINT (Ctrl+C) to stop.
 
 Run only the forwarder receiver without hedging logic (dev/debug):
 
@@ -42,7 +44,12 @@ LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 # Optional: LIGHTER_WS_SERVER_PINGS=true to force legacy app-level ping/pong
 # Optional: API_KEY_PRIVATE_KEY overrides LIGHTER_PRIVATE_KEY
+VARIATIONAL_ORDER_URL=https://omni.variational.io/api/orders
+VARIATIONAL_ORDER_METHOD=POST
+VARIATIONAL_ORDER_BODY_TEMPLATE={"instrument":"{asset}","side":"{side}","qty":"{qty}","type":"market"}
 ```
+
+Real `VARIATIONAL_ORDER_*` values must be captured from browser DevTools for the logged-in user.
 
 ## Architecture
 
@@ -90,3 +97,25 @@ The Python runtime MUST be running before the extension is started — the exten
 - The `variational/` package exposes `VariationalMonitor`, `EventSink`, `run_receiver_server`, and `HEARTBEAT_STALE_SECONDS` to `main.py`. `main.py` constructs its own `VariationalRuntime` wrapper around these rather than using `variational.listener.run` (which is the standalone entrypoint with its own CLI and CommandBroker).
 - Ticker mapping is centralized in `VARIATIONAL_TICKER_OVERRIDES` in `main.py`. When adding a new asset whose symbol differs between venues, add it there — `resolve_variational_ticker` / `resolve_lighter_ticker` and `accepted_assets` all derive from it.
 - Heartbeat staleness: the monitor considers the `/events` stream alive if a heartbeat was seen within `HEARTBEAT_STALE_SECONDS` (11s). `wait_for_variational_ready` blocks startup on this.
+
+### 4. Auto-trade pipeline (added 2026-04-19)
+
+The runtime is no longer passive. On every `SignalEngine` green-edge (same formula as the dashboard used to compute inline), `AutoTrader` fires Variational + Lighter legs in parallel via:
+
+- `VariationalCmdClient` → `CommandBroker` (:8768) → Chrome extension `background.js CommandSocket` → `content_script.js` `fetch()` on variational.io (browser session, so auth/cookies flow automatically).
+- `LighterAdapterImpl.place_order` (thin wrapper over the existing `SignerClient.create_order`).
+
+Cycle IDs (`cyc-YYYYMMDDHHMMSS-8hex`) correlate every event back to a single row in `log/cycle_pnl.jsonl` — that file is the canonical replay table.
+
+Logging is off the main path: both `order_events.jsonl` and `cycle_pnl.jsonl` go through `EventJournal`, an async-queue-backed writer that drops-and-counts on overflow rather than blocking. Signal edges go to `signal_events.jsonl` via the same mechanism.
+
+Breaker state machine: 3 consecutive failures or 5 failures in a UTC day → `TraderStats.frozen = True` → dashboard panel turns red, no new cycles fire. Only a process restart clears it.
+
+The Variational order API URL / body shape is **runtime config** (not code). Set `VARIATIONAL_ORDER_URL`, `VARIATIONAL_ORDER_METHOD`, and `VARIATIONAL_ORDER_BODY_TEMPLATE` in `.env`; the body template uses `{side}`, `{qty}`, `{asset}` placeholders.
+
+Key files:
+- `variational/signal.py` — `SignalEngine`, `SignalState`, `DirectionState`
+- `variational/auto_trader.py` — `AutoTrader`, `TradeCycle`, attribution math
+- `variational/command_client.py` — `VariationalCmdClient`
+- `variational/journal.py` — `EventJournal`
+- `chrome_extension/content_script.js` — fetch proxy inside variational.io
