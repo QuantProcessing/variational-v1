@@ -210,7 +210,10 @@ class VariationalMonitor:
             asset = str(instrument.get("underlying", "UNKNOWN"))
 
         trade_id = str(data.get("id", ""))
-        rfq_id = str(data.get("rfq_id", "")).strip() or None
+        # Variational /events WS calls it `source_rfq` (the rfq this fill
+        # originated from). It corresponds to the rfq_id returned by
+        # /api/orders/new/market — that's what AutoTrader uses for correlation.
+        rfq_id = str(data.get("source_rfq", "")).strip() or None
         summary = {
             "timestamp": data.get("created_at") or payload.get("timestamp") or "-",
             "trade_id": trade_id,
