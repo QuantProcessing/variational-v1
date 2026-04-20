@@ -32,6 +32,7 @@ from variational.listener import (
     run_command_server,
     run_receiver_server,
 )
+from variational.signal import SignalEngine
 
 VARIATIONAL_TICKER_OVERRIDES = {
     "LIT": "LIGHTER",
@@ -51,7 +52,6 @@ POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
 DASHBOARD_ORDERS = 8
-SPREAD_HISTORY_SECONDS = 3600.0
 ASSET_SWITCH_CONFIRM_TICKS = 3
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
@@ -245,7 +245,7 @@ class VariationalToLighterRuntime:
         self.record_order: deque[str] = deque(maxlen=500)
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
         self._record_lock = asyncio.Lock()
-        self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
+        self.signal_engine = SignalEngine(strict=False)
         self._asset_switch_lock = asyncio.Lock()
         self._asset_switch_candidate: str | None = None
         self._asset_switch_candidate_hits = 0
@@ -361,7 +361,7 @@ class VariationalToLighterRuntime:
             self.records.clear()
             self.record_order.clear()
             self.lighter_client_order_to_trade_key.clear()
-        self.cross_spread_history.clear()
+        self.signal_engine = SignalEngine(strict=False)
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -890,60 +890,35 @@ class VariationalToLighterRuntime:
             return "-"
         return f"{value:.4f}%"
 
-    def _record_cross_spreads(
-        self,
-        long_var_short_lighter_pct: Decimal | None,
-        short_var_long_lighter_pct: Decimal | None,
-    ) -> None:
-        now = time.monotonic()
-        self.cross_spread_history.append(
-            (
-                now,
-                self._decimal_as_float(long_var_short_lighter_pct),
-                self._decimal_as_float(short_var_long_lighter_pct),
-            )
-        )
-        cutoff = now - SPREAD_HISTORY_SECONDS
-        while self.cross_spread_history and self.cross_spread_history[0][0] < cutoff:
-            self.cross_spread_history.popleft()
-
-    def _median_cross_spread(self, window_seconds: float, long_side: bool) -> float | None:
-        now = time.monotonic()
-        cutoff = now - window_seconds
-        value_index = 1 if long_side else 2
-        values = [
-            row[value_index]
-            for row in self.cross_spread_history
-            if row[0] >= cutoff and row[value_index] is not None
-        ]
-        if not values:
-            return None
-        return float(median(values))
-
     async def render_dashboard(self) -> Group:
         var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+
+        state = self.signal_engine.record(
+            asset=quote_asset or self.variational_ticker,
+            var_bid=var_bid,
+            var_ask=var_ask,
+            lighter_bid=lighter_bid,
+            lighter_ask=lighter_ask,
+        )
+        # Edges consumed here so _prev_*_green advance; journaling/dispatch added in later tasks.
+        self.signal_engine.detect_edges()
+
         var_book_spread = spread_value(var_bid, var_ask)
         lighter_book_spread = spread_value(lighter_bid, lighter_ask)
-        var_book_spread_pct = book_spread_percent(var_bid, var_ask)
-        lighter_book_spread_pct = book_spread_percent(lighter_bid, lighter_ask)
-        spread_color_baseline: Decimal | None = None
-        if var_book_spread_pct is not None and lighter_book_spread_pct is not None:
-            spread_color_baseline = (var_book_spread_pct + lighter_book_spread_pct) / Decimal("2")
+        var_book_spread_pct = state.var_book_spread_pct
+        lighter_book_spread_pct = state.lighter_book_spread_pct
+        spread_color_baseline = state.book_spread_baseline_pct
 
-        long_var_short_lighter_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
-        short_var_long_lighter_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
-        self._record_cross_spreads(
-            long_var_short_lighter_pct,
-            short_var_long_lighter_pct,
-        )
+        long_var_short_lighter_pct = state.long_direction.cross_spread_pct
+        short_var_long_lighter_pct = state.short_direction.cross_spread_pct
 
-        long_pct_median_5m = self._median_cross_spread(5 * 60, long_side=True)
-        long_pct_median_30m = self._median_cross_spread(30 * 60, long_side=True)
-        long_pct_median_1h = self._median_cross_spread(60 * 60, long_side=True)
-        short_pct_median_5m = self._median_cross_spread(5 * 60, long_side=False)
-        short_pct_median_30m = self._median_cross_spread(30 * 60, long_side=False)
-        short_pct_median_1h = self._median_cross_spread(60 * 60, long_side=False)
+        long_pct_median_5m = state.long_direction.median_5m_pct
+        long_pct_median_30m = state.long_direction.median_30m_pct
+        long_pct_median_1h = state.long_direction.median_1h_pct
+        short_pct_median_5m = state.short_direction.median_5m_pct
+        short_pct_median_30m = state.short_direction.median_30m_pct
+        short_pct_median_1h = state.short_direction.median_1h_pct
 
         async with self._record_lock:
             recent_keys = list(self.record_order)[-DASHBOARD_ORDERS:]
