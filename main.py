@@ -434,14 +434,14 @@ class VariationalToLighterRuntime:
         self.dashboard_task: asyncio.Task[None] | None = None
 
         qty_dec = Decimal(args.qty)
-        imbalance_dec = Decimal(args.max_net_imbalance)
+        position_limit_dec = Decimal(args.position_limit)
         self.auto_trader_config = AutoTraderConfig(
             qty=qty_dec,
             throttle_seconds=args.throttle_seconds,
             max_trades_per_day=args.max_trades_per_day,
             var_fee_bps=args.var_fee_bps,
             lighter_fee_bps=args.lighter_fee_bps,
-            max_net_imbalance=imbalance_dec,
+            position_limit=position_limit_dec,
             leg_settle_timeout_sec=args.leg_settle_timeout_sec,
             var_order_timeout_ms=args.var_order_timeout_ms,
         )
@@ -1462,8 +1462,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-trades-per-day", type=int, default=200)
     parser.add_argument("--var-fee-bps", type=float, default=0.0)
     parser.add_argument("--lighter-fee-bps", type=float, default=2.0)
-    parser.add_argument("--max-net-imbalance", type=str, default="0",
-                        help="Position imbalance breaker threshold; 0 means 2x qty.")
+    parser.add_argument("--position-limit", type=str, default="0",
+                        help="Net directional position ceiling (signed qty). At |net|>=limit "
+                             "we enter reduce-only mode until |net| drops to 50%% of limit. "
+                             "0 means auto-derive as 2x qty.")
     parser.add_argument("--signal-strict", action="store_true",
                         help="Require adjusted > max(5m,30m,1h) instead of any().")
     parser.add_argument("--var-order-timeout-ms", type=int, default=5000)

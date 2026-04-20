@@ -37,7 +37,8 @@ class AutoTraderConfig:
     max_trades_per_day: int = 200
     var_fee_bps: float = 0.0
     lighter_fee_bps: float = 2.0
-    max_net_imbalance: Decimal = Decimal("0")
+    position_limit: Decimal = Decimal("0")
+    reduce_only_resume_fraction: Decimal = Decimal("0.5")
     leg_settle_timeout_sec: float = 10.0
     var_order_timeout_ms: int = 5000
     hedge_slippage_bps: float = 100.0
@@ -198,12 +199,14 @@ class AutoTrader:
         # that cancelled/partial cycles don't lock the accumulator permanently.
         self._directional_net_qty: Decimal = Decimal("0")
         self._cycle_signed_qty: dict[str, Decimal] = {}
-        # One-shot flag so we only warn once per run when imbalance starts
-        # gating new cycles.
-        self._warned_imbalance_skip = False
+        # Hysteresis: once |net_qty| reaches position_limit we flip into
+        # reduce-only mode (reject any fire that doesn't strictly shrink
+        # |net_qty|). We stay in reduce-only until |net_qty| drops below
+        # position_limit * reduce_only_resume_fraction (default 50%).
+        self._reduce_only_mode = False
 
-        if self.config.max_net_imbalance == 0:
-            self.config.max_net_imbalance = self.config.qty * Decimal("2")
+        if self.config.position_limit == 0:
+            self.config.position_limit = self.config.qty * Decimal("2")
 
     # ---------- public API ----------
 
@@ -242,21 +245,41 @@ class AutoTrader:
         if ds.adjusted_pct is None or float(ds.adjusted_pct) <= 0:
             return "signal_flipped"
 
-        # Net-imbalance gate: prevent accumulating same-direction cycles past
-        # the configured threshold. Reducing fires (opposite sign) are always
-        # allowed because they shrink |projected|.
+        # Position-limit hysteresis:
+        # - normal mode: reject if projected |net| would exceed position_limit
+        # - reduce-only mode: reject any fire that doesn't strictly shrink |net|
         signed = self.config.qty if direction == "long_var_short_lighter" else -self.config.qty
-        projected = self._directional_net_qty + signed
-        if abs(projected) > self.config.max_net_imbalance:
-            if not self._warned_imbalance_skip:
-                self.logger.warning(
-                    "Net imbalance gate engaged: current=%s proposed=%s projected=%s threshold=%s. "
-                    "Waiting for opposite-direction signal to rebalance.",
-                    self._directional_net_qty, signed, projected, self.config.max_net_imbalance,
-                )
-                self._warned_imbalance_skip = True
-            return "net_imbalance_exceeded"
+        current = self._directional_net_qty
+        projected = current + signed
+        if self._reduce_only_mode:
+            if abs(projected) >= abs(current):
+                return "reduce_only_mode"
+        else:
+            if abs(projected) > self.config.position_limit:
+                return "position_limit_exceeded"
         return None
+
+    def _update_mode(self) -> None:
+        """Recompute reduce-only state based on current _directional_net_qty.
+
+        Must be called while holding self._lock (callers already do).
+        """
+        abs_net = abs(self._directional_net_qty)
+        limit = self.config.position_limit
+        resume_at = limit * self.config.reduce_only_resume_fraction
+        if not self._reduce_only_mode and abs_net >= limit:
+            self._reduce_only_mode = True
+            self.logger.warning(
+                "Entering reduce-only mode: net=%s limit=%s. "
+                "Only opposite-direction fires allowed until |net| <= %s.",
+                self._directional_net_qty, limit, resume_at,
+            )
+        elif self._reduce_only_mode and abs_net <= resume_at:
+            self._reduce_only_mode = False
+            self.logger.info(
+                "Exiting reduce-only mode: net=%s resume_at=%s. Resuming normal cycle dispatch.",
+                self._directional_net_qty, resume_at,
+            )
 
     def _maybe_rollover(self) -> None:
         today = _today_key()
@@ -318,6 +341,7 @@ class AutoTrader:
             self.stats.trades_today += 1
             self._directional_net_qty += signed_commitment
             self._cycle_signed_qty[cycle_id] = signed_commitment
+            self._update_mode()
 
         self.events.emit({
             "ts": now_iso, "event": "cycle_opened", "cycle_id": cycle_id,
@@ -633,6 +657,7 @@ class AutoTrader:
             unfilled_refund = committed * (Decimal("1") - actual_min_ratio)
             if unfilled_refund != 0:
                 self._directional_net_qty -= unfilled_refund
+            self._update_mode()
 
         attribution = self._compute_attribution(cycle)
         cycles_row = self._cycle_to_row(cycle, attribution)
