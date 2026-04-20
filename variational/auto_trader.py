@@ -462,6 +462,21 @@ class AutoTrader:
             return
         self._apply_lighter_fill(cycle, fill_px, fill_qty)
 
+    def peek_lighter_info(
+        self, rfq_id: str
+    ) -> tuple[int | None, str | None, Decimal | None, str | None]:
+        """Read-only lookup for the dashboard's OrderLifecycle bridge.
+
+        Returns (client_order_id, tx_hash, avg_fill_px, filled_at) for an open
+        cycle whose var_leg was tagged with this rfq_id. All-None when no
+        match (cycle never existed, or already settled and popped).
+        """
+        for cycle in self._open_cycles.values():
+            if rfq_id in cycle.var_leg.trade_ids:
+                leg = cycle.lighter_leg
+                return (leg.client_order_id, leg.tx_hash, leg.avg_fill_px, leg.filled_at)
+        return (None, None, None, None)
+
     def _apply_var_fill(self, cycle: TradeCycle, fill_px: Decimal, fill_qty: Decimal) -> None:
         leg = cycle.var_leg
         prior_filled = leg.filled_qty

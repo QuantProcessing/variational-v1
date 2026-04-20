@@ -911,9 +911,28 @@ class VariationalToLighterRuntime:
             # AutoTrader stores rfq_id (returned by /api/orders/new/market) on
             # var_leg.trade_ids; match by rfq_id, not by the fill-level trade_id.
             # listener normalizes rfq_id to str-or-None already.
-            correlation_key = event.get("rfq_id") or str(event.get("trade_id", "")).strip() or None
+            rfq_id = event.get("rfq_id")
+            correlation_key = rfq_id or str(event.get("trade_id", "")).strip() or None
             if fill_px is not None and fill_qty_new is not None and correlation_key:
                 await self.auto_trader.on_variational_fill(correlation_key, fill_px, fill_qty_new)
+
+            # Bridge AutoTrader's cycle state into the legacy OrderLifecycle so the
+            # dashboard's "recent orders" table and trade_records.csv can show
+            # the Lighter leg. Without this link, handle_lighter_fill_update has
+            # no trade_key to update because place_lighter_order (which used to
+            # populate lighter_client_order_to_trade_key) was removed.
+            if rfq_id and created_record is not None:
+                co_id, tx_hash, lighter_avg_px, lighter_filled_at = self.auto_trader.peek_lighter_info(rfq_id)
+                if co_id is not None:
+                    async with self._record_lock:
+                        created_record.lighter_side = "SELL" if side == "buy" else "BUY"
+                        created_record.lighter_client_order_id = co_id
+                        created_record.lighter_tx_hash = tx_hash
+                        self.lighter_client_order_to_trade_key[co_id] = key
+                        if lighter_avg_px is not None:
+                            created_record.lighter_fill_price = lighter_avg_px
+                        if lighter_filled_at is not None:
+                            created_record.lighter_fill_ts_iso = lighter_filled_at
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
