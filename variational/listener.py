@@ -823,7 +823,7 @@ def parse_args() -> ListenerConfig:
     parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind receivers.")
     parser.add_argument("--ws-port", type=int, default=8766, help="Port for WebSocket frame events.")
     parser.add_argument("--rest-port", type=int, default=8767, help="Port for REST response events.")
-    parser.add_argument("--command-port", type=int, default=8768, help="Port for PLACE_ORDER command broker.")
+    parser.add_argument("--command-port", type=int, default=8768, help="Port for the EXECUTE_FETCH command broker.")
     parser.add_argument(
         "--output-dir",
         type=Path,
