@@ -49,9 +49,14 @@ FORWARDER_HOST = "127.0.0.1"
 FORWARDER_WS_PORT = 8766
 FORWARDER_REST_PORT = 8767
 FORWARDER_COMMAND_PORT = 8768
-VAR_ORDER_URL_ENV = "VARIATIONAL_ORDER_URL"
-VAR_ORDER_METHOD_ENV = "VARIATIONAL_ORDER_METHOD"
-VAR_ORDER_BODY_TEMPLATE_ENV = "VARIATIONAL_ORDER_BODY_TEMPLATE"
+VAR_QUOTE_URL = "https://omni.variational.io/api/quotes/indicative"
+VAR_NEW_MARKET_URL = "https://omni.variational.io/api/orders/new/market"
+# Variational perpetual futures on omni.variational.io are all hourly-funded,
+# USDC-settled. If Variational adds products outside that shape, make these
+# overrides per-asset.
+VAR_FUNDING_INTERVAL_S = 3600
+VAR_SETTLEMENT_ASSET = "USDC"
+VAR_INSTRUMENT_TYPE = "perpetual_future"
 LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
@@ -216,50 +221,101 @@ class VariationalRuntime:
 
 
 class VariationalPlacerImpl:
+    """Two-step RFQ flow: /api/quotes/indicative → /api/orders/new/market.
+
+    Variational wants a quote_id before accepting a market order, so we request
+    an indicative quote for the exact (asset, qty), then pass its quote_id to
+    the order endpoint with side + max_slippage. The response's rfq_id becomes
+    the correlation key for matching fills streamed over /events WS.
+    """
+
     def __init__(
         self,
         cmd: VariationalCmdClient,
-        url: str,
-        method: str,
-        body_template: str,
+        max_slippage: float,
         logger: logging.Logger,
     ) -> None:
         self.cmd = cmd
-        self.url = url
-        self.method = method
-        self.body_template = body_template
+        self.max_slippage = max_slippage
         self.logger = logger
 
     async def place_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
-        try:
-            body = self.body_template.format(side=side, qty=format(qty, "f"), asset=asset)
-        except KeyError as exc:
-            return VarPlaceResult(ok=False, error=f"body_template_missing_key: {exc}")
-        res = await self.cmd.execute_fetch(
-            url=self.url,
-            method=self.method,
+        import json as _json
+
+        qty_str = format(qty, "f")
+        indicative_body = _json.dumps({
+            "instrument": {
+                "underlying": asset,
+                "funding_interval_s": VAR_FUNDING_INTERVAL_S,
+                "settlement_asset": VAR_SETTLEMENT_ASSET,
+                "instrument_type": VAR_INSTRUMENT_TYPE,
+            },
+            "qty": qty_str,
+        })
+        quote_res = await self.cmd.execute_fetch(
+            url=VAR_QUOTE_URL,
+            method="POST",
             headers={"content-type": "application/json"},
-            body=body,
+            body=indicative_body,
             timeout_ms=timeout_ms,
         )
-        if not res.ok or (res.status and res.status >= 400):
+        if not quote_res.ok or (quote_res.status is not None and quote_res.status >= 400):
             return VarPlaceResult(
                 ok=False,
-                raw_status=res.status, raw_body=res.body,
-                latency_ms=res.latency_ms, error=res.error or f"http_{res.status}",
-                request_id=res.request_id,
+                raw_status=quote_res.status, raw_body=quote_res.body,
+                latency_ms=quote_res.latency_ms,
+                error=quote_res.error or f"quote_http_{quote_res.status}",
+                request_id=quote_res.request_id,
             )
-        trade_id = None
         try:
-            import json as _json
-            parsed = _json.loads(res.body or "{}")
-            if isinstance(parsed, dict):
-                trade_id = str(parsed.get("id") or parsed.get("trade_id") or parsed.get("order_id") or "") or None
+            quote_parsed = _json.loads(quote_res.body or "{}")
+        except Exception as exc:
+            return VarPlaceResult(ok=False, error=f"quote_parse_failed: {exc}", raw_body=quote_res.body)
+        quote_id = quote_parsed.get("quote_id") if isinstance(quote_parsed, dict) else None
+        if not quote_id:
+            return VarPlaceResult(ok=False, error="quote_missing_id", raw_body=quote_res.body)
+
+        order_body = _json.dumps({
+            "quote_id": quote_id,
+            "side": side,
+            "max_slippage": self.max_slippage,
+            "is_reduce_only": False,
+        })
+        order_res = await self.cmd.execute_fetch(
+            url=VAR_NEW_MARKET_URL,
+            method="POST",
+            headers={"content-type": "application/json"},
+            body=order_body,
+            timeout_ms=timeout_ms,
+        )
+        if not order_res.ok or (order_res.status is not None and order_res.status >= 400):
+            return VarPlaceResult(
+                ok=False,
+                raw_status=order_res.status, raw_body=order_res.body,
+                latency_ms=order_res.latency_ms,
+                error=order_res.error or f"order_http_{order_res.status}",
+                request_id=order_res.request_id,
+            )
+        rfq_id: str | None = None
+        try:
+            order_parsed = _json.loads(order_res.body or "{}")
+            if isinstance(order_parsed, dict):
+                raw_rfq = order_parsed.get("rfq_id")
+                rfq_id = str(raw_rfq) if raw_rfq else None
         except Exception:
             pass
+        if not rfq_id:
+            return VarPlaceResult(
+                ok=False, raw_status=order_res.status, raw_body=order_res.body,
+                latency_ms=order_res.latency_ms, error="order_missing_rfq_id",
+                request_id=order_res.request_id,
+            )
+        # trade_id is the correlation handle AutoTrader matches against fill
+        # events. Variational's /events WS reports fills with rfq_id, not the
+        # fill-level trade_id — see variational/listener.py._update_trade_event.
         return VarPlaceResult(
-            ok=True, raw_status=res.status, raw_body=res.body,
-            latency_ms=res.latency_ms, trade_id=trade_id, request_id=res.request_id,
+            ok=True, raw_status=order_res.status, raw_body=order_res.body,
+            latency_ms=order_res.latency_ms, trade_id=rfq_id, request_id=order_res.request_id,
         )
 
 
@@ -852,9 +908,12 @@ class VariationalToLighterRuntime:
         if self.auto_trader is not None and filled_payload is not None:
             fill_px = to_decimal(event.get("price"))
             fill_qty_new = to_decimal(event.get("qty"))
-            trade_id = str(event.get("trade_id", "")).strip()
-            if fill_px is not None and fill_qty_new is not None and trade_id:
-                await self.auto_trader.on_variational_fill(trade_id, fill_px, fill_qty_new)
+            # AutoTrader stores rfq_id (returned by /api/orders/new/market) on
+            # var_leg.trade_ids; match by rfq_id, not by the fill-level trade_id.
+            # listener normalizes rfq_id to str-or-None already.
+            correlation_key = event.get("rfq_id") or str(event.get("trade_id", "")).strip() or None
+            if fill_px is not None and fill_qty_new is not None and correlation_key:
+                await self.auto_trader.on_variational_fill(correlation_key, fill_px, fill_qty_new)
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
@@ -1314,15 +1373,6 @@ class VariationalToLighterRuntime:
         initial_asset = await self.wait_for_ticker_resolution()
         await self.activate_asset(initial_asset, reason="startup")
 
-        var_order_url = os.getenv(VAR_ORDER_URL_ENV, "").strip()
-        var_order_method = os.getenv(VAR_ORDER_METHOD_ENV, "POST").strip().upper()
-        var_order_body_template = os.getenv(VAR_ORDER_BODY_TEMPLATE_ENV, "").strip()
-        if not var_order_url or not var_order_body_template:
-            raise RuntimeError(
-                f"{VAR_ORDER_URL_ENV} and {VAR_ORDER_BODY_TEMPLATE_ENV} must be set in .env "
-                "with the real Variational order API (captured from browser DevTools)."
-            )
-
         self.cmd_client = VariationalCmdClient(FORWARDER_HOST, FORWARDER_COMMAND_PORT, self.logger)
         await self.cmd_client.start()
         try:
@@ -1330,7 +1380,11 @@ class VariationalToLighterRuntime:
         except asyncio.TimeoutError:
             self.logger.warning("CmdClient did not connect within 10s; orders will fail until the broker is up.")
 
-        var_placer = VariationalPlacerImpl(self.cmd_client, var_order_url, var_order_method, var_order_body_template, self.logger)
+        var_placer = VariationalPlacerImpl(
+            self.cmd_client,
+            max_slippage=self.args.var_max_slippage_bps / 10000.0,
+            logger=self.logger,
+        )
         lighter_adapter = LighterAdapterImpl(self)
         self.auto_trader = AutoTrader(
             signal=self.signal_engine,
@@ -1406,6 +1460,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--leg-settle-timeout-sec", type=float, default=10.0)
     parser.add_argument("--debug-var-payload", action="store_true",
                         help="Write full Variational request/response bodies to order_events.jsonl.")
+    parser.add_argument("--var-max-slippage-bps", type=float, default=100.0,
+                        help="Variational market order max_slippage in bps (1%% = 100). Passed to /api/orders/new/market.")
     parser.add_argument("--lang", choices=["zh", "en"], default="zh")
     return parser.parse_args()
 

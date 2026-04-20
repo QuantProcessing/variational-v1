@@ -210,9 +210,11 @@ class VariationalMonitor:
             asset = str(instrument.get("underlying", "UNKNOWN"))
 
         trade_id = str(data.get("id", ""))
+        rfq_id = str(data.get("rfq_id", "")).strip() or None
         summary = {
             "timestamp": data.get("created_at") or payload.get("timestamp") or "-",
             "trade_id": trade_id,
+            "rfq_id": rfq_id,
             "side": data.get("side", "-"),
             "asset": asset,
             "price": data.get("price", "-"),
