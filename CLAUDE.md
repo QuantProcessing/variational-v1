@@ -70,7 +70,7 @@ The Python runtime MUST be running before the extension is started — the exten
   - `/api/quotes/indicative` REST body → `quotes[asset]` with bid/ask/mark and sets `current_quote_asset` (this is how the active asset is auto-detected — no manual ticker input).
   - `/events` WS → heartbeats, trades (assigned a monotonic `event_seq` used as a cursor by consumers), and other typed events.
   - `/portfolio` WS → positions and pool balance/pnl/margin.
-- `CommandBroker` runs on port `8768` and is a bidirectional PLACE_ORDER router between an external requester and an extension-registered socket. Not wired into `main.py`'s runtime — it's only used when running `python -m variational` standalone.
+- `CommandBroker` runs on port `8768` and is a generic fetch-proxy router (EXECUTE_FETCH / FETCH_RESULT) between an external requester and an extension-registered socket. Not wired into `main.py`'s runtime — it's only used when running `python -m variational` standalone.
 - All monitor state reads/writes go through `monitor._lock` (asyncio). Consumers that reach into `monitor.quotes` / `monitor.current_quote_asset` directly (as `main.py` does) must acquire that lock.
 
 ### 3. Runtime orchestrator (`main.py`)
