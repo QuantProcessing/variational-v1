@@ -306,16 +306,26 @@ class AutoTrader:
         if lighter_bid is None or lighter_ask is None:
             cycle.lighter_leg.error = "lighter_book_empty"
             cycle.lighter_leg.terminal = True
-        slippage = Decimal(str(self.config.hedge_slippage_bps)) / Decimal("10000")
-        if lighter_side == "BUY":
-            limit_px = (lighter_ask * (Decimal("1") + slippage)) if lighter_ask else None
+            cycle.reason_codes.append("lighter_book_empty")
+            self._register_failure("lighter_book_empty")
+            self.events.emit({
+                "ts": _utc_now_iso(), "event": "cycle_error",
+                "cycle_id": cycle.cycle_id, "side": "lighter",
+                "error_msg": "lighter_book_empty",
+            })
+            limit_px = None
         else:
-            limit_px = (lighter_bid * (Decimal("1") - slippage)) if lighter_bid else None
+            slippage = Decimal(str(self.config.hedge_slippage_bps)) / Decimal("10000")
+            if lighter_side == "BUY":
+                limit_px = lighter_ask * (Decimal("1") + slippage)
+            else:
+                limit_px = lighter_bid * (Decimal("1") - slippage)
         cycle.lighter_leg.limit_px = limit_px
 
-        var_task = asyncio.create_task(self._fire_var_leg(cycle, var_side))
-        lighter_task = asyncio.create_task(self._fire_lighter_leg(cycle, lighter_side))
-        await asyncio.gather(var_task, lighter_task, return_exceptions=True)
+        tasks = [asyncio.create_task(self._fire_var_leg(cycle, var_side))]
+        if not cycle.lighter_leg.terminal:
+            tasks.append(asyncio.create_task(self._fire_lighter_leg(cycle, lighter_side)))
+        await asyncio.gather(*tasks, return_exceptions=True)
 
         asyncio.create_task(self._settle_cycle_when_done(cycle))
 
