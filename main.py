@@ -341,6 +341,8 @@ class VariationalToLighterRuntime:
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.signal_events_file = output_dir / "signal_events.jsonl" if output_dir else LOG_DIR / "signal_events.jsonl"
         self.signal_journal = EventJournal(self.signal_events_file)
+        self.events_journal = EventJournal(LOG_DIR / "order_events.jsonl")
+        self.cycles_journal = EventJournal(LOG_DIR / "cycle_pnl.jsonl")
         self.auto_trader = None    # constructed in run() once market is known (Task 3.6)
         self.cmd_client: VariationalCmdClient | None = None
         self._order_write_lock = asyncio.Lock()
@@ -351,7 +353,7 @@ class VariationalToLighterRuntime:
         self.record_order: deque[str] = deque(maxlen=500)
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
         self._record_lock = asyncio.Lock()
-        self.signal_engine = SignalEngine(strict=False)
+        self.signal_engine = SignalEngine(strict=args.signal_strict)
         self._asset_switch_lock = asyncio.Lock()
         self._asset_switch_candidate: str | None = None
         self._asset_switch_candidate_hits = 0
@@ -380,6 +382,19 @@ class VariationalToLighterRuntime:
         self.lighter_ws_task: asyncio.Task[None] | None = None
         self.trade_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
+
+        qty_dec = Decimal(args.qty)
+        imbalance_dec = Decimal(args.max_net_imbalance)
+        self.auto_trader_config = AutoTraderConfig(
+            qty=qty_dec,
+            throttle_seconds=args.throttle_seconds,
+            max_trades_per_day=args.max_trades_per_day,
+            var_fee_bps=args.var_fee_bps,
+            lighter_fee_bps=args.lighter_fee_bps,
+            max_net_imbalance=imbalance_dec,
+            leg_settle_timeout_sec=args.leg_settle_timeout_sec,
+            var_order_timeout_ms=args.var_order_timeout_ms,
+        )
 
     def print_startup_next_steps(self) -> None:
         is_zh = self.args.lang == "zh"
@@ -467,7 +482,7 @@ class VariationalToLighterRuntime:
             self.records.clear()
             self.record_order.clear()
             self.lighter_client_order_to_trade_key.clear()
-        self.signal_engine = SignalEngine(strict=False)
+        self.signal_engine = SignalEngine(strict=self.args.signal_strict)
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -803,7 +818,7 @@ class VariationalToLighterRuntime:
                     side=side,
                     qty=qty,
                     asset=asset if asset else "UNKNOWN",
-                    auto_hedge_enabled=self.args.auto_hedge,
+                    auto_hedge_enabled=True,
                     last_variational_status=status,
                 )
                 self.records[key] = record
@@ -982,6 +997,8 @@ class VariationalToLighterRuntime:
         # Edges consumed here so _prev_*_green advance; journaling/dispatch added in later tasks.
         for direction, event in self.signal_engine.detect_edges():
             self._emit_signal_edge(direction, state, event=event)
+            if event == "signal_turned_green" and self.auto_trader is not None:
+                asyncio.create_task(self.auto_trader.on_green_edge(direction, state))
 
         var_book_spread = spread_value(var_bid, var_ask)
         lighter_book_spread = spread_value(lighter_bid, lighter_ask)
@@ -1034,8 +1051,8 @@ class VariationalToLighterRuntime:
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
         variational_label = "Variational"
         lighter_label = "Lighter"
-        hedge_color = "green" if self.args.auto_hedge else "red"
-        hedge_text = auto_hedge_on if self.args.auto_hedge else auto_hedge_off
+        hedge_color = "green" if True else "red"
+        hedge_text = auto_hedge_on if True else auto_hedge_off
 
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
@@ -1240,9 +1257,20 @@ class VariationalToLighterRuntime:
                 await self.export_trade_records_csv()
 
     async def run(self) -> None:
+        self.logger.info(
+            "Startup config: qty=%s throttle_s=%.1f max_trades/day=%d var_fee_bps=%.1f lighter_fee_bps=%.1f "
+            "signal_strict=%s leg_timeout_s=%.1f var_order_timeout_ms=%d lang=%s",
+            self.auto_trader_config.qty, self.auto_trader_config.throttle_seconds,
+            self.auto_trader_config.max_trades_per_day,
+            self.auto_trader_config.var_fee_bps, self.auto_trader_config.lighter_fee_bps,
+            self.args.signal_strict, self.auto_trader_config.leg_settle_timeout_sec,
+            self.auto_trader_config.var_order_timeout_ms, self.args.lang,
+        )
         self.setup_signal_handlers()
         await self.runtime.start()
         await self.signal_journal.start()
+        await self.events_journal.start()
+        await self.cycles_journal.start()
         self.print_startup_next_steps()
         self.logger.info(
             "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s",
@@ -1257,6 +1285,40 @@ class VariationalToLighterRuntime:
         self.initialize_lighter_client()
         initial_asset = await self.wait_for_ticker_resolution()
         await self.activate_asset(initial_asset, reason="startup")
+
+        var_order_url = os.getenv(VAR_ORDER_URL_ENV, "").strip()
+        var_order_method = os.getenv(VAR_ORDER_METHOD_ENV, "POST").strip().upper()
+        var_order_body_template = os.getenv(VAR_ORDER_BODY_TEMPLATE_ENV, "").strip()
+        if not var_order_url or not var_order_body_template:
+            raise RuntimeError(
+                f"{VAR_ORDER_URL_ENV} and {VAR_ORDER_BODY_TEMPLATE_ENV} must be set in .env "
+                "with the real Variational order API (captured from browser DevTools)."
+            )
+
+        self.cmd_client = VariationalCmdClient(FORWARDER_HOST, FORWARDER_COMMAND_PORT, self.logger)
+        await self.cmd_client.start()
+        try:
+            await self.cmd_client.wait_ready(timeout=10)
+        except asyncio.TimeoutError:
+            self.logger.warning("CmdClient did not connect within 10s; orders will fail until the broker is up.")
+
+        var_placer = VariationalPlacerImpl(self.cmd_client, var_order_url, var_order_method, var_order_body_template, self.logger)
+        lighter_adapter = LighterAdapterImpl(self)
+        self.auto_trader = AutoTrader(
+            signal=self.signal_engine,
+            var_placer=var_placer,
+            lighter=lighter_adapter,
+            config=self.auto_trader_config,
+            events_journal=self.events_journal,
+            cycles_journal=self.cycles_journal,
+            logger=self.logger,
+        )
+        self.logger.info(
+            "AutoTrader initialized: qty=%s throttle=%.1fs max/day=%d fees(var/lighter bps)=%.1f/%.1f",
+            self.auto_trader_config.qty, self.auto_trader_config.throttle_seconds,
+            self.auto_trader_config.max_trades_per_day,
+            self.auto_trader_config.var_fee_bps, self.auto_trader_config.lighter_fee_bps,
+        )
 
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
         self.logger.info("Tracking new Variational trade events from seq>%s", self.trade_event_cursor)
@@ -1283,6 +1345,10 @@ class VariationalToLighterRuntime:
             await asyncio.gather(self.lighter_ws_task, return_exceptions=True)
 
         await self.signal_journal.stop()
+        await self.events_journal.stop()
+        await self.cycles_journal.stop()
+        if self.cmd_client is not None:
+            await self.cmd_client.stop()
 
         if self.lighter_client is not None:
             close_method = getattr(self.lighter_client, "close", None)
@@ -1297,21 +1363,22 @@ class VariationalToLighterRuntime:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Track Variational order lifecycle and optionally auto-hedge on Lighter (ticker auto-detected)."
+        description="Cross-venue spread trader. Auto-triggers on green-light signal; writes per-cycle P&L attribution."
     )
-    parser.add_argument(
-        "--lang",
-        choices=["zh", "en"],
-        default="zh",
-        help="Dashboard language: zh (Chinese) or en (English). Default: zh",
-    )
-    parser.add_argument(
-        "--no-hedge",
-        action="store_false",
-        dest="auto_hedge",
-        help="Disable automatic Lighter hedge placement (default: enabled)",
-    )
-    parser.set_defaults(auto_hedge=True)
+    parser.add_argument("--qty", required=True, type=str, help="Per-cycle base asset qty (required). Example: 0.01")
+    parser.add_argument("--throttle-seconds", type=float, default=3.0)
+    parser.add_argument("--max-trades-per-day", type=int, default=200)
+    parser.add_argument("--var-fee-bps", type=float, default=0.0)
+    parser.add_argument("--lighter-fee-bps", type=float, default=2.0)
+    parser.add_argument("--max-net-imbalance", type=str, default="0",
+                        help="Position imbalance breaker threshold; 0 means 2x qty.")
+    parser.add_argument("--signal-strict", action="store_true",
+                        help="Require adjusted > max(5m,30m,1h) instead of any().")
+    parser.add_argument("--var-order-timeout-ms", type=int, default=5000)
+    parser.add_argument("--leg-settle-timeout-sec", type=float, default=10.0)
+    parser.add_argument("--debug-var-payload", action="store_true",
+                        help="Write full Variational request/response bodies to order_events.jsonl.")
+    parser.add_argument("--lang", choices=["zh", "en"], default="zh")
     return parser.parse_args()
 
 
