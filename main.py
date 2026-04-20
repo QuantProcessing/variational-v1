@@ -1157,6 +1157,34 @@ class VariationalToLighterRuntime:
                     self._fmt_pct(fill_diff_pct),
                 )
 
+        stats = self.auto_trader.snapshot() if self.auto_trader is not None else None
+        if stats is not None:
+            dropped = (
+                self.signal_journal.dropped_count
+                + self.events_journal.dropped_count
+                + self.cycles_journal.dropped_count
+            )
+            frozen_suffix = "" if not stats.frozen else f"  \u26a0 FROZEN[{stats.frozen_reason}]"
+            if dropped == 0:
+                drop_suffix = ""
+            else:
+                drop_suffix = f"  \u26a0 \u65e5\u5fd7\u4e22\u5f03 {dropped}" if is_zh else f"  \u26a0 journal drops {dropped}"
+            if is_zh:
+                stats_line = (
+                    f"\u4eca\u65e5 {stats.trades_today} \u7b14 | \u5931\u8d25 {stats.failures_today} | "
+                    f"\u7d2f\u8ba1\u51c0\u5229(\u540d\u4e49) {format(stats.cumulative_realized_net_notional, 'f')} | "
+                    f"\u5747\u6ed1\u70b9 bps var={stats.avg_var_slippage_bps:.1f} lighter={stats.avg_lighter_slippage_bps:.1f} | "
+                    f"\u7194\u65ad: {'OK' if not stats.frozen else 'FROZEN'}{frozen_suffix}{drop_suffix}"
+                )
+            else:
+                stats_line = (
+                    f"today {stats.trades_today} trades | fail {stats.failures_today} | "
+                    f"cum net (notional) {format(stats.cumulative_realized_net_notional, 'f')} | "
+                    f"avg slip bps var={stats.avg_var_slippage_bps:.1f} lighter={stats.avg_lighter_slippage_bps:.1f} | "
+                    f"breaker: {'OK' if not stats.frozen else 'FROZEN'}{frozen_suffix}{drop_suffix}"
+                )
+            stats_panel = Panel(stats_line, border_style=("red" if stats.frozen else "green"))
+            return Group(header, quote_table, spread_table, orders_table, stats_panel)
         return Group(header, quote_table, spread_table, orders_table)
 
     async def export_trade_records_csv(self) -> None:
