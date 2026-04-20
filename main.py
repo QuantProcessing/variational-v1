@@ -24,6 +24,11 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
+from variational.auto_trader import (
+    AutoTrader, AutoTraderConfig, LighterAdapter, LighterPlaceResult,
+    VariationalPlacer, VarPlaceResult,
+)
+from variational.command_client import VariationalCmdClient
 from variational.journal import EventJournal
 from variational.listener import (
     HEARTBEAT_STALE_SECONDS,
@@ -44,6 +49,9 @@ FORWARDER_HOST = "127.0.0.1"
 FORWARDER_WS_PORT = 8766
 FORWARDER_REST_PORT = 8767
 FORWARDER_COMMAND_PORT = 8768
+VAR_ORDER_URL_ENV = "VARIATIONAL_ORDER_URL"
+VAR_ORDER_METHOD_ENV = "VARIATIONAL_ORDER_METHOD"
+VAR_ORDER_BODY_TEMPLATE_ENV = "VARIATIONAL_ORDER_BODY_TEMPLATE"
 LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
@@ -207,6 +215,99 @@ class VariationalRuntime:
                 await server.wait_closed()
 
 
+class VariationalPlacerImpl:
+    def __init__(
+        self,
+        cmd: VariationalCmdClient,
+        url: str,
+        method: str,
+        body_template: str,
+        logger: logging.Logger,
+    ) -> None:
+        self.cmd = cmd
+        self.url = url
+        self.method = method
+        self.body_template = body_template
+        self.logger = logger
+
+    async def place_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
+        try:
+            body = self.body_template.format(side=side, qty=format(qty, "f"), asset=asset)
+        except KeyError as exc:
+            return VarPlaceResult(ok=False, error=f"body_template_missing_key: {exc}")
+        res = await self.cmd.execute_fetch(
+            url=self.url,
+            method=self.method,
+            headers={"content-type": "application/json"},
+            body=body,
+            timeout_ms=timeout_ms,
+        )
+        if not res.ok or (res.status and res.status >= 400):
+            return VarPlaceResult(
+                ok=False,
+                raw_status=res.status, raw_body=res.body,
+                latency_ms=res.latency_ms, error=res.error or f"http_{res.status}",
+                request_id=res.request_id,
+            )
+        trade_id = None
+        try:
+            import json as _json
+            parsed = _json.loads(res.body or "{}")
+            if isinstance(parsed, dict):
+                trade_id = str(parsed.get("id") or parsed.get("trade_id") or parsed.get("order_id") or "") or None
+        except Exception:
+            pass
+        return VarPlaceResult(
+            ok=True, raw_status=res.status, raw_body=res.body,
+            latency_ms=res.latency_ms, trade_id=trade_id, request_id=res.request_id,
+        )
+
+
+class LighterAdapterImpl:
+    def __init__(self, runtime: "VariationalToLighterRuntime") -> None:
+        self.runtime = runtime
+
+    async def best_bid_ask(self):
+        return await self.runtime.get_lighter_best_bid_ask()
+
+    async def place_order(self, side: str, qty: Decimal, limit_px: Decimal) -> LighterPlaceResult:
+        runtime = self.runtime
+        base_amount = int(qty * runtime.base_amount_multiplier)
+        if base_amount <= 0:
+            return LighterPlaceResult(ok=False, error=f"qty_rounds_to_zero: {qty}")
+        price_i = int(limit_px * runtime.price_multiplier)
+        is_ask = (side == "SELL")
+        client_order_id = int(time.time() * 1000)
+        if not hasattr(runtime, "_auto_client_orders"):
+            runtime._auto_client_orders = set()
+        while (
+            client_order_id in runtime.lighter_client_order_to_trade_key
+            or client_order_id in runtime._auto_client_orders
+        ):
+            client_order_id += 1
+        runtime._auto_client_orders.add(client_order_id)
+        try:
+            async with runtime._lighter_signer_lock:
+                if not runtime.lighter_client:
+                    runtime.initialize_lighter_client()
+                _, tx_hash, error = await runtime.lighter_client.create_order(
+                    market_index=runtime.lighter_market_index,
+                    client_order_index=client_order_id,
+                    base_amount=base_amount,
+                    price=price_i,
+                    is_ask=is_ask,
+                    order_type=runtime.lighter_client.ORDER_TYPE_LIMIT,
+                    time_in_force=runtime.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                    reduce_only=False,
+                    trigger_price=0,
+                )
+            if error is not None:
+                return LighterPlaceResult(ok=False, client_order_id=client_order_id, error=f"sign: {error}")
+            return LighterPlaceResult(ok=True, client_order_id=client_order_id, tx_hash=tx_hash)
+        except Exception as exc:
+            return LighterPlaceResult(ok=False, client_order_id=client_order_id, error=f"exception: {exc}")
+
+
 class VariationalToLighterRuntime:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -240,6 +341,8 @@ class VariationalToLighterRuntime:
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.signal_events_file = output_dir / "signal_events.jsonl" if output_dir else LOG_DIR / "signal_events.jsonl"
         self.signal_journal = EventJournal(self.signal_events_file)
+        self.auto_trader = None    # constructed in run() once market is known (Task 3.6)
+        self.cmd_client: VariationalCmdClient | None = None
         self._order_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
         self._trade_records_snapshot_sig: str | None = None
@@ -489,6 +592,17 @@ class VariationalToLighterRuntime:
 
         await self.append_order_log("lighter_fill", payload)
 
+        if self.auto_trader is not None:
+            client_order_id_raw = order.get("client_order_id")
+            try:
+                client_order_id_int = int(client_order_id_raw)
+            except Exception:
+                client_order_id_int = None
+            if client_order_id_int is not None and fill_price is not None:
+                filled_base = to_decimal(order.get("filled_base_amount"))
+                if filled_base is not None:
+                    await self.auto_trader.on_lighter_fill(client_order_id_int, fill_price, filled_base)
+
     def build_lighter_ws_url(self) -> str:
         if env_flag("LIGHTER_WS_SERVER_PINGS"):
             return f"{LIGHTER_WS_URL}?server_pings=true"
@@ -646,74 +760,6 @@ class VariationalToLighterRuntime:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
 
-    async def place_lighter_order(self, record: OrderLifecycle) -> None:
-        if not self.args.auto_hedge:
-            return
-
-        side = "SELL" if record.side == "buy" else "BUY"
-
-        best_bid, best_ask = await self.get_lighter_best_bid_ask()
-        if best_bid is None or best_ask is None:
-            async with self._record_lock:
-                record.hedge_error = "Lighter order book not ready"
-                payload = record.to_payload()
-            await self.append_order_log("lighter_error", payload)
-            return
-
-        slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
-        if side == "BUY":
-            is_ask = False
-            limit_price = best_ask * (Decimal("1") + slippage)
-        else:
-            is_ask = True
-            limit_price = best_bid * (Decimal("1") - slippage)
-
-        base_amount = int(record.qty * self.base_amount_multiplier)
-        if base_amount <= 0:
-            async with self._record_lock:
-                record.hedge_error = f"Hedge base amount rounds to zero ({record.qty})"
-                payload = record.to_payload()
-            await self.append_order_log("lighter_error", payload)
-            return
-
-        price_i = int(limit_price * self.price_multiplier)
-        async with self._record_lock:
-            client_order_id = int(time.time() * 1000)
-            while client_order_id in self.lighter_client_order_to_trade_key:
-                client_order_id += 1
-
-        try:
-            async with self._lighter_signer_lock:
-                if not self.lighter_client:
-                    self.initialize_lighter_client()
-                _, tx_hash, error = await self.lighter_client.create_order(
-                    market_index=self.lighter_market_index,
-                    client_order_index=client_order_id,
-                    base_amount=base_amount,
-                    price=price_i,
-                    is_ask=is_ask,
-                    order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                    time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                    reduce_only=False,
-                    trigger_price=0,
-                )
-
-            if error is not None:
-                raise RuntimeError(f"Sign error: {error}")
-
-            async with self._record_lock:
-                record.lighter_side = side
-                record.lighter_client_order_id = client_order_id
-                record.lighter_tx_hash = tx_hash
-                record.hedge_error = None
-                self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
-        except Exception as exc:
-            async with self._record_lock:
-                record.lighter_side = side
-                record.hedge_error = str(exc)
-                payload = record.to_payload()
-            await self.append_order_log("lighter_error", payload)
-
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
         if side not in {"buy", "sell"}:
@@ -788,8 +834,12 @@ class VariationalToLighterRuntime:
         if filled_payload is not None:
             await self.append_order_log("variational_fill", filled_payload)
 
-        if created and created_record is not None and self.args.auto_hedge:
-            await self.place_lighter_order(created_record)
+        if self.auto_trader is not None and filled_payload is not None:
+            fill_px = to_decimal(event.get("price"))
+            fill_qty_new = to_decimal(event.get("qty"))
+            trade_id = str(event.get("trade_id", "")).strip()
+            if fill_px is not None and fill_qty_new is not None and trade_id:
+                await self.auto_trader.on_variational_fill(trade_id, fill_px, fill_qty_new)
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
