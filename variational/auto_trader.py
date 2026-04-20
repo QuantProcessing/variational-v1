@@ -130,6 +130,7 @@ class LighterAdapter(Protocol):
         side: str,
         qty: Decimal,
         limit_px: Decimal,
+        client_order_id: int,
     ) -> "LighterPlaceResult": ...
 
 
@@ -322,9 +323,27 @@ class AutoTrader:
                 limit_px = lighter_bid * (Decimal("1") - slippage)
         cycle.lighter_leg.limit_px = limit_px
 
-        tasks = [asyncio.create_task(self._fire_var_leg(cycle, var_side))]
+        # Pre-assign + pre-register the Lighter client_order_id BEFORE we await
+        # place_order. The lighter-sdk's create_order waits for on-chain
+        # confirmation (~5s observed) and Lighter's account_orders WS can push
+        # the filled event during that window — if _lighter_order_to_cycle
+        # hasn't been populated yet the fill is silently dropped. Pre-register
+        # so on_lighter_fill can always resolve to a cycle.
+        lighter_client_order_id: int | None = None
         if not cycle.lighter_leg.terminal:
-            tasks.append(asyncio.create_task(self._fire_lighter_leg(cycle, lighter_side)))
+            now_mono_ms = int(time.time() * 1000)
+            async with self._lock:
+                lighter_client_order_id = now_mono_ms
+                while lighter_client_order_id in self._lighter_order_to_cycle:
+                    lighter_client_order_id += 1
+                self._lighter_order_to_cycle[lighter_client_order_id] = cycle.cycle_id
+            cycle.lighter_leg.client_order_id = lighter_client_order_id
+
+        tasks = [asyncio.create_task(self._fire_var_leg(cycle, var_side))]
+        if not cycle.lighter_leg.terminal and lighter_client_order_id is not None:
+            tasks.append(asyncio.create_task(
+                self._fire_lighter_leg(cycle, lighter_side, lighter_client_order_id)
+            ))
         await asyncio.gather(*tasks, return_exceptions=True)
 
         asyncio.create_task(self._settle_cycle_when_done(cycle))
@@ -372,12 +391,14 @@ class AutoTrader:
                 "cycle_id": cycle.cycle_id, "side": "var", "error_msg": str(exc),
             })
 
-    async def _fire_lighter_leg(self, cycle: TradeCycle, side: str) -> None:
+    async def _fire_lighter_leg(self, cycle: TradeCycle, side: str, client_order_id: int) -> None:
         if cycle.lighter_leg.limit_px is None:
             cycle.lighter_leg.error = "no_limit_px"
             cycle.lighter_leg.terminal = True
             self._register_failure("lighter_book_empty")
             cycle.reason_codes.append("lighter_book_empty")
+            async with self._lock:
+                self._lighter_order_to_cycle.pop(client_order_id, None)
             return
         cycle.lighter_leg.placed_at = _utc_now_iso()
         self.events.emit({
@@ -385,17 +406,19 @@ class AutoTrader:
             "cycle_id": cycle.cycle_id, "side": side,
             "qty": _dec_str(cycle.lighter_leg.requested_qty),
             "limit_px": _dec_str(cycle.lighter_leg.limit_px),
+            "client_order_id": client_order_id,
         })
         try:
             res = await self.lighter.place_order(
                 side=side,
                 qty=cycle.lighter_leg.requested_qty,
                 limit_px=cycle.lighter_leg.limit_px,
+                client_order_id=client_order_id,
             )
             self.events.emit({
                 "ts": _utc_now_iso(), "event": "lighter_place_ack",
                 "cycle_id": cycle.cycle_id, "ok": res.ok,
-                "client_order_id": res.client_order_id,
+                "client_order_id": client_order_id,
                 "tx_hash": res.tx_hash, "error": res.error,
             })
             if not res.ok:
@@ -403,17 +426,17 @@ class AutoTrader:
                 cycle.lighter_leg.terminal = True
                 self._register_failure("lighter_sign_error")
                 cycle.reason_codes.append(cycle.lighter_leg.error)
-                return
-            cycle.lighter_leg.client_order_id = res.client_order_id
-            cycle.lighter_leg.tx_hash = res.tx_hash
-            if res.client_order_id is not None:
                 async with self._lock:
-                    self._lighter_order_to_cycle[res.client_order_id] = cycle.cycle_id
+                    self._lighter_order_to_cycle.pop(client_order_id, None)
+                return
+            cycle.lighter_leg.tx_hash = res.tx_hash
         except Exception as exc:
             cycle.lighter_leg.error = f"exception: {exc}"
             cycle.lighter_leg.terminal = True
             self._register_failure("lighter_exception")
             cycle.reason_codes.append(cycle.lighter_leg.error)
+            async with self._lock:
+                self._lighter_order_to_cycle.pop(client_order_id, None)
             self.events.emit({
                 "ts": _utc_now_iso(), "event": "cycle_error",
                 "cycle_id": cycle.cycle_id, "side": "lighter", "error_msg": str(exc),

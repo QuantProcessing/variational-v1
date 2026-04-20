@@ -326,22 +326,16 @@ class LighterAdapterImpl:
     async def best_bid_ask(self):
         return await self.runtime.get_lighter_best_bid_ask()
 
-    async def place_order(self, side: str, qty: Decimal, limit_px: Decimal) -> LighterPlaceResult:
+    async def place_order(
+        self, side: str, qty: Decimal, limit_px: Decimal, client_order_id: int,
+    ) -> LighterPlaceResult:
         runtime = self.runtime
         base_amount = int(qty * runtime.base_amount_multiplier)
         if base_amount <= 0:
-            return LighterPlaceResult(ok=False, error=f"qty_rounds_to_zero: {qty}")
+            return LighterPlaceResult(ok=False, client_order_id=client_order_id,
+                                      error=f"qty_rounds_to_zero: {qty}")
         price_i = int(limit_px * runtime.price_multiplier)
         is_ask = (side == "SELL")
-        client_order_id = int(time.time() * 1000)
-        if not hasattr(runtime, "_auto_client_orders"):
-            runtime._auto_client_orders = set()
-        while (
-            client_order_id in runtime.lighter_client_order_to_trade_key
-            or client_order_id in runtime._auto_client_orders
-        ):
-            client_order_id += 1
-        runtime._auto_client_orders.add(client_order_id)
         try:
             async with runtime._lighter_signer_lock:
                 if not runtime.lighter_client:
