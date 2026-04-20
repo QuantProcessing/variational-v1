@@ -36,7 +36,7 @@ flake8 .   # max-line-length = 129
 
 No test suite exists in this repo.
 
-Required `.env` for live hedging:
+Required `.env`:
 
 ```
 LIGHTER_ACCOUNT_INDEX=...
@@ -44,12 +44,9 @@ LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 # Optional: LIGHTER_WS_SERVER_PINGS=true to force legacy app-level ping/pong
 # Optional: API_KEY_PRIVATE_KEY overrides LIGHTER_PRIVATE_KEY
-VARIATIONAL_ORDER_URL=https://omni.variational.io/api/orders
-VARIATIONAL_ORDER_METHOD=POST
-VARIATIONAL_ORDER_BODY_TEMPLATE={"instrument":"{asset}","side":"{side}","qty":"{qty}","type":"market"}
 ```
 
-Real `VARIATIONAL_ORDER_*` values must be captured from browser DevTools for the logged-in user.
+Variational order endpoints are hardcoded — `/api/quotes/indicative` then `/api/orders/new/market` (two-step RFQ flow). Instrument shape is `perpetual_future` / USDC / 3600s funding. Auth flows via the Chrome extension's browser session, so no Variational API key is needed in `.env`.
 
 ## Architecture
 
@@ -111,7 +108,7 @@ Logging is off the main path: both `order_events.jsonl` and `cycle_pnl.jsonl` go
 
 Breaker state machine: 3 consecutive failures or 5 failures in a UTC day → `TraderStats.frozen = True` → dashboard panel turns red, no new cycles fire. Only a process restart clears it.
 
-The Variational order API URL / body shape is **runtime config** (not code). Set `VARIATIONAL_ORDER_URL`, `VARIATIONAL_ORDER_METHOD`, and `VARIATIONAL_ORDER_BODY_TEMPLATE` in `.env`; the body template uses `{side}`, `{qty}`, `{asset}` placeholders.
+Variational uses a two-step RFQ flow, hardcoded in `VariationalPlacerImpl`: POST `/api/quotes/indicative` with `{instrument: {underlying, funding_interval_s: 3600, settlement_asset: "USDC", instrument_type: "perpetual_future"}, qty}` → returns `quote_id`; then POST `/api/orders/new/market` with `{quote_id, side, max_slippage, is_reduce_only: false}` → returns `rfq_id`. The rfq_id is the AutoTrader correlation key for matching fill events on `/events` WS (the monitor extracts it from the raw trade payload). `max_slippage` is configurable via `--var-max-slippage-bps` (default 100 = 1%).
 
 Key files:
 - `variational/signal.py` — `SignalEngine`, `SignalState`, `DirectionState`
