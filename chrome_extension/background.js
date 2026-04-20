@@ -343,6 +343,7 @@ async function startForwarding(tabId = null) {
   }
 
   state.active = true;
+  commandSocket.connect();
   state.attachedTabId = targetTabId;
   state.lastError = null;
   wsForwarder.connect();
@@ -368,6 +369,7 @@ async function stopForwarding() {
 
 function cleanupForwardingState() {
   state.active = false;
+  commandSocket.disconnect();
   state.pendingResponses.clear();
   state.websocketMeta.clear();
   state.attachedTabId = null;
@@ -601,3 +603,111 @@ chrome.runtime.onInstalled.addListener(() => {
     // Ignore config load errors during install.
   });
 });
+
+// ==== CommandSocket: bridges Python CommandBroker (:8768) to the variational.io content_script ====
+const COMMAND_ENDPOINT = "ws://127.0.0.1:8768";
+
+class CommandSocket {
+  constructor() {
+    this.ws = null;
+    this.retryTimer = null;
+    this.status = "disconnected";
+  }
+
+  connect() {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    try {
+      const socket = new WebSocket(COMMAND_ENDPOINT);
+      this.ws = socket;
+      this.status = "connecting";
+
+      socket.onopen = () => {
+        if (this.ws !== socket) return;
+        this.status = "connected";
+        socket.send(JSON.stringify({ type: "REGISTER", role: "extension" }));
+      };
+
+      socket.onclose = () => {
+        if (this.ws === socket) {
+          this.ws = null;
+          this.status = "disconnected";
+          this.scheduleRetry();
+        }
+      };
+
+      socket.onerror = () => {
+        try { socket.close(); } catch (_) {}
+      };
+
+      socket.onmessage = async (event) => {
+        let payload = null;
+        try {
+          payload = JSON.parse(event.data);
+        } catch (_) { return; }
+        if (!payload || typeof payload !== "object") return;
+        const type = String(payload.type || "").toUpperCase();
+        if (type === "EXECUTE_FETCH") {
+          await this.handleExecuteFetch(payload);
+        }
+      };
+    } catch (err) {
+      this.scheduleRetry();
+    }
+  }
+
+  scheduleRetry() {
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (state.active) this.connect();
+    }, 2000);
+  }
+
+  async handleExecuteFetch(payload) {
+    const requestId = payload.requestId;
+    const targetTabId = state.attachedTabId;
+    if (targetTabId == null) {
+      this.sendResult({ type: "FETCH_RESULT", requestId, ok: false, error: "no_attached_tab" });
+      return;
+    }
+    try {
+      const response = await chrome.tabs.sendMessage(targetTabId, {
+        type: "EXECUTE_FETCH",
+        fetch: payload.fetch || {},
+        timeoutMs: payload.timeoutMs || 5000,
+      });
+      this.sendResult({
+        type: "FETCH_RESULT",
+        requestId,
+        ok: !!response?.ok,
+        status: response?.status,
+        body: response?.body,
+        latencyMs: response?.latencyMs,
+        error: response?.error,
+      });
+    } catch (err) {
+      this.sendResult({
+        type: "FETCH_RESULT",
+        requestId,
+        ok: false,
+        error: `content_script_unreachable: ${err && err.message ? err.message : err}`,
+      });
+    }
+  }
+
+  sendResult(msg) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try { this.ws.send(JSON.stringify(msg)); } catch (_) {}
+    }
+  }
+
+  disconnect() {
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
+    this.status = "disconnected";
+  }
+}
+
+const commandSocket = new CommandSocket();
