@@ -192,6 +192,16 @@ class AutoTrader:
         self._lighter_order_to_cycle: dict[int, str] = {}
         self._lock = asyncio.Lock()
 
+        # Accumulated signed qty across all fired cycles (+qty for
+        # long_var_short_lighter, -qty for short_var_long_lighter). Incremented
+        # at fire time; reduced on close when fill_ratio < 1 or legs failed so
+        # that cancelled/partial cycles don't lock the accumulator permanently.
+        self._directional_net_qty: Decimal = Decimal("0")
+        self._cycle_signed_qty: dict[str, Decimal] = {}
+        # One-shot flag so we only warn once per run when imbalance starts
+        # gating new cycles.
+        self._warned_imbalance_skip = False
+
         if self.config.max_net_imbalance == 0:
             self.config.max_net_imbalance = self.config.qty * Decimal("2")
 
@@ -231,6 +241,21 @@ class AutoTrader:
         ds = state.long_direction if direction == "long_var_short_lighter" else state.short_direction
         if ds.adjusted_pct is None or float(ds.adjusted_pct) <= 0:
             return "signal_flipped"
+
+        # Net-imbalance gate: prevent accumulating same-direction cycles past
+        # the configured threshold. Reducing fires (opposite sign) are always
+        # allowed because they shrink |projected|.
+        signed = self.config.qty if direction == "long_var_short_lighter" else -self.config.qty
+        projected = self._directional_net_qty + signed
+        if abs(projected) > self.config.max_net_imbalance:
+            if not self._warned_imbalance_skip:
+                self.logger.warning(
+                    "Net imbalance gate engaged: current=%s proposed=%s projected=%s threshold=%s. "
+                    "Waiting for opposite-direction signal to rebalance.",
+                    self._directional_net_qty, signed, projected, self.config.max_net_imbalance,
+                )
+                self._warned_imbalance_skip = True
+            return "net_imbalance_exceeded"
         return None
 
     def _maybe_rollover(self) -> None:
@@ -286,10 +311,13 @@ class AutoTrader:
         cycle.var_leg.requested_qty = self.config.qty
         cycle.lighter_leg.requested_qty = self.config.qty
 
+        signed_commitment = self.config.qty if direction == "long_var_short_lighter" else -self.config.qty
         async with self._lock:
             self._open_cycles[cycle_id] = cycle
             self._last_fire_monotonic[direction] = now_mono
             self.stats.trades_today += 1
+            self._directional_net_qty += signed_commitment
+            self._cycle_signed_qty[cycle_id] = signed_commitment
 
         self.events.emit({
             "ts": now_iso, "event": "cycle_opened", "cycle_id": cycle_id,
@@ -422,10 +450,20 @@ class AutoTrader:
                 "tx_hash": res.tx_hash, "error": res.error,
             })
             if not res.ok:
-                cycle.lighter_leg.error = res.error or "unknown"
+                err = res.error or "unknown"
+                cycle.lighter_leg.error = err
                 cycle.lighter_leg.terminal = True
-                self._register_failure("lighter_sign_error")
-                cycle.reason_codes.append(cycle.lighter_leg.error)
+                err_lc = err.lower()
+                # Insufficient margin is a hard stop — keep retrying and we
+                # just hammer Lighter's API while positions stay stranded.
+                # Trip the breaker immediately rather than accumulating 3
+                # consecutive failures.
+                if "not enough margin" in err_lc or "code=21739" in err_lc:
+                    self._trip_breaker("lighter_insufficient_margin")
+                    cycle.reason_codes.append("lighter_insufficient_margin")
+                else:
+                    self._register_failure("lighter_sign_error")
+                    cycle.reason_codes.append(err)
                 async with self._lock:
                     self._lighter_order_to_cycle.pop(client_order_id, None)
                 return
@@ -570,10 +608,31 @@ class AutoTrader:
                 cycle.status = "one_leg_failed"
 
         cycle.closed_at = _utc_now_iso()
+        # Reconcile directional_net_qty against actual fills. The cycle
+        # contributed `signed_commitment` at fire time on the assumption it
+        # would fully fill. If it partially filled or failed, refund the
+        # unfilled portion so the accumulator reflects real exposure, not
+        # pending commitments that never materialized.
+        qty_target = cycle.var_leg.requested_qty or self.config.qty
+        actual_min_ratio = Decimal("0")
+        if qty_target > 0:
+            var_ratio = (cycle.var_leg.filled_qty / qty_target) if cycle.var_leg.filled_qty else Decimal("0")
+            lig_ratio = (cycle.lighter_leg.filled_qty / qty_target) if cycle.lighter_leg.filled_qty else Decimal("0")
+            # Use min() because both legs together represent the "matched"
+            # exposure; unmatched single-leg fills are residual risk but for
+            # cross-venue balance we track the matched part.
+            actual_min_ratio = min(var_ratio, lig_ratio)
+            if actual_min_ratio > Decimal("1"):
+                actual_min_ratio = Decimal("1")
+
         async with self._lock:
             self._open_cycles.pop(cycle.cycle_id, None)
             if cycle.lighter_leg.client_order_id is not None:
                 self._lighter_order_to_cycle.pop(cycle.lighter_leg.client_order_id, None)
+            committed = self._cycle_signed_qty.pop(cycle.cycle_id, Decimal("0"))
+            unfilled_refund = committed * (Decimal("1") - actual_min_ratio)
+            if unfilled_refund != 0:
+                self._directional_net_qty -= unfilled_refund
 
         attribution = self._compute_attribution(cycle)
         cycles_row = self._cycle_to_row(cycle, attribution)
