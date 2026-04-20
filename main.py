@@ -645,6 +645,14 @@ class VariationalToLighterRuntime:
         if filled_quote is not None and filled_base is not None and filled_base != 0:
             fill_price = filled_quote / filled_base
 
+        # Route to AutoTrader FIRST; this path uses _lighter_order_to_cycle
+        # which is populated by AutoTrader itself, independent of the legacy
+        # OrderLifecycle bookkeeping below. Must run before any early return
+        # that is gated on the legacy lookup (which fails under the new
+        # AutoTrader-driven flow since place_lighter_order is gone).
+        if self.auto_trader is not None and fill_price is not None and filled_base is not None:
+            await self.auto_trader.on_lighter_fill(client_order_id, fill_price, filled_base)
+
         now_iso = utc_now()
 
         async with self._record_lock:
@@ -662,17 +670,6 @@ class VariationalToLighterRuntime:
             payload = record.to_payload()
 
         await self.append_order_log("lighter_fill", payload)
-
-        if self.auto_trader is not None:
-            client_order_id_raw = order.get("client_order_id")
-            try:
-                client_order_id_int = int(client_order_id_raw)
-            except Exception:
-                client_order_id_int = None
-            if client_order_id_int is not None and fill_price is not None:
-                filled_base = to_decimal(order.get("filled_base_amount"))
-                if filled_base is not None:
-                    await self.auto_trader.on_lighter_fill(client_order_id_int, fill_price, filled_base)
 
     def build_lighter_ws_url(self) -> str:
         if env_flag("LIGHTER_WS_SERVER_PINGS"):
