@@ -202,6 +202,14 @@ class SignalEngine:
         )
 
     def _median_window(self, window_seconds: float, long_side: bool, now: float) -> float | None:
+        # Only return a median if history covers at least the full window.
+        # Otherwise "5m", "30m", "1h" medians all collapse onto the same few
+        # recent samples and the green-light test degenerates into "slightly
+        # higher than the last handful of ticks" — signal would fire seconds
+        # after startup instead of waiting for real history. Require the
+        # oldest sample to predate the window's cutoff.
+        if not self._history or self._history[0][0] > now - window_seconds:
+            return None
         cutoff = now - window_seconds
         idx = 1 if long_side else 2
         values = [row[idx] for row in self._history if row[0] >= cutoff and row[idx] is not None]
@@ -211,14 +219,30 @@ class SignalEngine:
 
 
 def _self_test() -> None:
-    eng = SignalEngine(strict=False)
-
-    # Seed history with 30 quiet ticks where cross spread ≈ 0.01%.
+    # --- Warmup gate: short history must NOT produce a green signal ---
+    eng_warmup = SignalEngine(strict=False)
     now0 = time.monotonic()
+    # Seed only 30 seconds of history (far less than the 5m window).
     for i in range(30):
-        eng._history.append((now0 - (30 - i) * 0.1, 0.01, 0.01))
+        eng_warmup._history.append((now0 - (30 - i), 0.01, 0.01))
+    s = eng_warmup.record(
+        asset="BTC",
+        var_bid=Decimal("100.0"),
+        var_ask=Decimal("100.1"),
+        lighter_bid=Decimal("100.5"),
+        lighter_ask=Decimal("100.6"),
+    )
+    assert s.long_direction.median_5m_pct is None, "5m median must be None during warmup"
+    assert s.long_direction.median_30m_pct is None
+    assert s.long_direction.median_1h_pct is None
+    assert not s.long_direction.is_green, "warmup: no medians → no green even on wide spread"
 
-    # Current tick: lighter_bid well above var_ask → wide cross spread.
+    # --- Post-warmup: history covers the 5m window, median_5m participates ---
+    eng = SignalEngine(strict=False)
+    now0 = time.monotonic()
+    # Seed 10 minutes of history spaced 1s apart, quiet cross spread ≈ 0.01%.
+    for i in range(600):
+        eng._history.append((now0 - (600 - i), 0.01, 0.01))
     s = eng.record(
         asset="BTC",
         var_bid=Decimal("100.0"),
@@ -226,14 +250,15 @@ def _self_test() -> None:
         lighter_bid=Decimal("100.5"),
         lighter_ask=Decimal("100.6"),
     )
-    assert s.long_direction.cross_spread_pct is not None
-    assert s.long_direction.adjusted_pct is not None
+    assert s.long_direction.median_5m_pct is not None, "5m median should be available after 10m history"
+    assert s.long_direction.median_30m_pct is None, "30m median still gated (history only 10m)"
     assert float(s.long_direction.adjusted_pct) > 0, s.long_direction.adjusted_pct
     assert s.long_direction.is_green, s.long_direction
 
     edges = eng.detect_edges()
     assert ("long_var_short_lighter", "signal_turned_green") in edges, edges
 
+    # Second identical tick: still green but no edge (no transition).
     eng.record(
         asset="BTC",
         var_bid=Decimal("100.0"),
@@ -241,14 +266,13 @@ def _self_test() -> None:
         lighter_bid=Decimal("100.5"),
         lighter_ask=Decimal("100.6"),
     )
-    edges = eng.detect_edges()
-    assert edges == [], edges
+    assert eng.detect_edges() == []
 
-    # Strict mode should gate on max of medians.
+    # --- Strict mode: max of populated medians ---
     eng_strict = SignalEngine(strict=True)
     now0 = time.monotonic()
-    for i in range(30):
-        eng_strict._history.append((now0 - (30 - i) * 0.1, 5.0, 5.0))
+    for i in range(600):
+        eng_strict._history.append((now0 - (600 - i), 5.0, 5.0))
     s = eng_strict.record(
         asset="BTC",
         var_bid=Decimal("100.0"),
@@ -256,7 +280,7 @@ def _self_test() -> None:
         lighter_bid=Decimal("100.2"),
         lighter_ask=Decimal("100.3"),
     )
-    assert not s.long_direction.is_green, "strict mode should reject when adjusted < max-median"
+    assert not s.long_direction.is_green, "strict: adjusted < max(medians) rejects"
 
     print("SignalEngine OK")
 
