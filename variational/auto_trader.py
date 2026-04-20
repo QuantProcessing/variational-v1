@@ -442,6 +442,254 @@ class AutoTrader:
         self.logger.warning("Breaker tripped: %s (consecutive=%d daily=%d)",
                             reason, self.stats.consecutive_failures, self.stats.failures_today)
 
+    async def on_variational_fill(self, trade_id: str, fill_px: Decimal, fill_qty: Decimal) -> None:
+        """Route a Variational fill (from monitor) to an open cycle by trade_id."""
+        async with self._lock:
+            target: TradeCycle | None = None
+            for cycle in self._open_cycles.values():
+                if trade_id in cycle.var_leg.trade_ids:
+                    target = cycle
+                    break
+        if target is None:
+            return
+        self._apply_var_fill(target, fill_px, fill_qty)
+
+    async def on_lighter_fill(self, client_order_id: int, fill_px: Decimal, fill_qty: Decimal) -> None:
+        async with self._lock:
+            cycle_id = self._lighter_order_to_cycle.get(client_order_id)
+            cycle = self._open_cycles.get(cycle_id) if cycle_id else None
+        if cycle is None:
+            return
+        self._apply_lighter_fill(cycle, fill_px, fill_qty)
+
+    def _apply_var_fill(self, cycle: TradeCycle, fill_px: Decimal, fill_qty: Decimal) -> None:
+        leg = cycle.var_leg
+        prior_filled = leg.filled_qty
+        leg.filled_qty += fill_qty
+        if leg.avg_fill_px is None:
+            leg.avg_fill_px = fill_px
+        else:
+            leg.avg_fill_px = ((leg.avg_fill_px * prior_filled) + (fill_px * fill_qty)) / leg.filled_qty
+        leg.partial_fill_count += 1
+        leg.filled_at = _utc_now_iso()
+        self.events.emit({
+            "ts": leg.filled_at, "event": "var_fill",
+            "cycle_id": cycle.cycle_id, "fill_px": _dec_str(fill_px),
+            "fill_qty": _dec_str(fill_qty),
+        })
+        if leg.filled_qty >= leg.requested_qty:
+            leg.terminal = True
+
+    def _apply_lighter_fill(self, cycle: TradeCycle, fill_px: Decimal, fill_qty: Decimal) -> None:
+        leg = cycle.lighter_leg
+        prior_filled = leg.filled_qty
+        leg.filled_qty += fill_qty
+        if leg.avg_fill_px is None:
+            leg.avg_fill_px = fill_px
+        else:
+            leg.avg_fill_px = ((leg.avg_fill_px * prior_filled) + (fill_px * fill_qty)) / leg.filled_qty
+        leg.partial_fill_count += 1
+        leg.filled_at = _utc_now_iso()
+        self.events.emit({
+            "ts": leg.filled_at, "event": "lighter_fill",
+            "cycle_id": cycle.cycle_id, "fill_px": _dec_str(fill_px),
+            "fill_qty": _dec_str(fill_qty),
+        })
+        if leg.filled_qty >= leg.requested_qty:
+            leg.terminal = True
+
     async def _settle_cycle_when_done(self, cycle: TradeCycle) -> None:
-        # Body in Task 3.4.
-        raise NotImplementedError
+        deadline = asyncio.get_running_loop().time() + self.config.leg_settle_timeout_sec
+        while asyncio.get_running_loop().time() < deadline:
+            if cycle.var_leg.terminal and cycle.lighter_leg.terminal:
+                break
+            await asyncio.sleep(0.2)
+
+        var_ok = cycle.var_leg.filled_qty >= cycle.var_leg.requested_qty
+        lighter_ok = cycle.lighter_leg.filled_qty >= cycle.lighter_leg.requested_qty
+
+        if var_ok and lighter_ok:
+            cycle.status = "fully_filled"
+            self.stats.consecutive_failures = 0
+        elif not cycle.var_leg.error and not cycle.lighter_leg.error and (
+            cycle.var_leg.filled_qty > 0 or cycle.lighter_leg.filled_qty > 0
+        ):
+            cycle.status = "partial"
+            if not var_ok:
+                cycle.reason_codes.append(
+                    "var_depth_shortfall" if cycle.var_leg.filled_qty > 0 else "var_timeout"
+                )
+            if not lighter_ok:
+                cycle.reason_codes.append(
+                    "lighter_depth_shortfall" if cycle.lighter_leg.filled_qty > 0 else "lighter_timeout"
+                )
+        else:
+            var_failed = not var_ok
+            lighter_failed = not lighter_ok
+            if var_failed and lighter_failed:
+                cycle.status = "both_failed"
+            else:
+                cycle.status = "one_leg_failed"
+
+        cycle.closed_at = _utc_now_iso()
+        async with self._lock:
+            self._open_cycles.pop(cycle.cycle_id, None)
+            if cycle.lighter_leg.client_order_id is not None:
+                self._lighter_order_to_cycle.pop(cycle.lighter_leg.client_order_id, None)
+
+        attribution = self._compute_attribution(cycle)
+        cycles_row = self._cycle_to_row(cycle, attribution)
+        self.cycles.emit(cycles_row)
+        self.events.emit({
+            "ts": cycle.closed_at, "event": "cycle_closed",
+            "cycle_id": cycle.cycle_id, "status": cycle.status,
+        })
+
+        self._update_stats_on_close(cycle, attribution)
+
+    def _compute_attribution(self, cycle: TradeCycle) -> dict[str, Any]:
+        plan = cycle.plan or TradePlan(
+            qty_target=cycle.var_leg.requested_qty,
+            expected_var_fill_px=None,
+            expected_lighter_fill_px=None,
+            expected_gross_pct=None,
+            expected_net_pct=None,
+        )
+        var_avg = cycle.var_leg.avg_fill_px
+        lig_avg = cycle.lighter_leg.avg_fill_px
+
+        realized_net_pct: float | None = None
+        var_slip_pct: float | None = None
+        lig_slip_pct: float | None = None
+        fee_pct = (self.config.var_fee_bps + self.config.lighter_fee_bps) / 100.0
+
+        if cycle.direction == "long_var_short_lighter" and var_avg is not None and lig_avg is not None and var_avg != 0:
+            realized_gross = float((lig_avg - var_avg) / var_avg) * 100.0
+            realized_net_pct = realized_gross - fee_pct
+        elif cycle.direction == "short_var_long_lighter" and var_avg is not None and lig_avg is not None and lig_avg != 0:
+            realized_gross = float((var_avg - lig_avg) / lig_avg) * 100.0
+            realized_net_pct = realized_gross - fee_pct
+
+        if plan.expected_var_fill_px is not None and var_avg is not None and plan.expected_var_fill_px != 0:
+            if cycle.direction == "long_var_short_lighter":
+                var_slip_pct = float((var_avg - plan.expected_var_fill_px) / plan.expected_var_fill_px) * 100.0
+            else:
+                var_slip_pct = float((plan.expected_var_fill_px - var_avg) / plan.expected_var_fill_px) * 100.0
+        if plan.expected_lighter_fill_px is not None and lig_avg is not None and plan.expected_lighter_fill_px != 0:
+            if cycle.direction == "long_var_short_lighter":
+                lig_slip_pct = float((plan.expected_lighter_fill_px - lig_avg) / plan.expected_lighter_fill_px) * 100.0
+            else:
+                lig_slip_pct = float((lig_avg - plan.expected_lighter_fill_px) / plan.expected_lighter_fill_px) * 100.0
+
+        qty_t = cycle.var_leg.requested_qty
+        fill_ratio = min(
+            float(cycle.var_leg.filled_qty / qty_t) if qty_t else 0.0,
+            float(cycle.lighter_leg.filled_qty / qty_t) if qty_t else 0.0,
+        )
+
+        vs_expected = None
+        if realized_net_pct is not None and plan.expected_net_pct is not None:
+            vs_expected = realized_net_pct - plan.expected_net_pct
+
+        return {
+            "realized_net_pct": realized_net_pct,
+            "vs_expected_pct_delta": vs_expected,
+            "components": {
+                "var_slippage_pct": var_slip_pct,
+                "lighter_slippage_pct": lig_slip_pct,
+                "fee_pct": fee_pct,
+                "fill_ratio": fill_ratio,
+                "quote_drift_ms": cycle.quote_drift_ms,
+                "reason_codes": list(cycle.reason_codes),
+            },
+        }
+
+    def _cycle_to_row(self, cycle: TradeCycle, attribution: dict[str, Any]) -> dict[str, Any]:
+        s = cycle.signal_snapshot
+        plan = cycle.plan or TradePlan(cycle.var_leg.requested_qty, None, None, None, None)
+        duration_ms = None
+        if cycle.opened_at and cycle.closed_at:
+            try:
+                t0 = datetime.fromisoformat(cycle.opened_at.replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat(cycle.closed_at.replace("Z", "+00:00"))
+                duration_ms = int((t1 - t0).total_seconds() * 1000)
+            except Exception:
+                duration_ms = None
+        if s is not None:
+            direction_state = s.long_direction if cycle.direction == "long_var_short_lighter" else s.short_direction
+            signal_block = {
+                "adjusted_pct": _dec_str(direction_state.adjusted_pct),
+                "baseline_pct": _dec_str(s.book_spread_baseline_pct),
+                "median_5m_pct": direction_state.median_5m_pct,
+                "median_30m_pct": direction_state.median_30m_pct,
+                "median_1h_pct": direction_state.median_1h_pct,
+                "var_bid": _dec_str(s.var_bid),
+                "var_ask": _dec_str(s.var_ask),
+                "lighter_bid": _dec_str(s.lighter_bid),
+                "lighter_ask": _dec_str(s.lighter_ask),
+            }
+        else:
+            signal_block = {
+                "adjusted_pct": None, "baseline_pct": None,
+                "median_5m_pct": None, "median_30m_pct": None, "median_1h_pct": None,
+                "var_bid": None, "var_ask": None, "lighter_bid": None, "lighter_ask": None,
+            }
+        return {
+            "cycle_id": cycle.cycle_id,
+            "triggered_at": cycle.opened_at,
+            "closed_at": cycle.closed_at,
+            "duration_ms": duration_ms,
+            "asset": cycle.asset,
+            "direction": cycle.direction,
+            "status": cycle.status,
+            "signal": signal_block,
+            "plan": {
+                "qty_target": _dec_str(plan.qty_target),
+                "expected_var_fill_px": _dec_str(plan.expected_var_fill_px),
+                "expected_lighter_fill_px": _dec_str(plan.expected_lighter_fill_px),
+                "expected_gross_pct": plan.expected_gross_pct,
+                "expected_net_pct": plan.expected_net_pct,
+            },
+            "var_leg": {
+                "placed_at": cycle.var_leg.placed_at,
+                "filled_at": cycle.var_leg.filled_at,
+                "requested_qty": _dec_str(cycle.var_leg.requested_qty),
+                "filled_qty": _dec_str(cycle.var_leg.filled_qty),
+                "avg_fill_px": _dec_str(cycle.var_leg.avg_fill_px),
+                "api_latency_ms": cycle.var_leg.api_latency_ms,
+                "partial_fill_count": cycle.var_leg.partial_fill_count,
+                "error": cycle.var_leg.error,
+            },
+            "lighter_leg": {
+                "placed_at": cycle.lighter_leg.placed_at,
+                "filled_at": cycle.lighter_leg.filled_at,
+                "client_order_id": cycle.lighter_leg.client_order_id,
+                "requested_qty": _dec_str(cycle.lighter_leg.requested_qty),
+                "filled_qty": _dec_str(cycle.lighter_leg.filled_qty),
+                "avg_fill_px": _dec_str(cycle.lighter_leg.avg_fill_px),
+                "limit_px": _dec_str(cycle.lighter_leg.limit_px),
+                "tx_hash": cycle.lighter_leg.tx_hash,
+                "error": cycle.lighter_leg.error,
+            },
+            "attribution": attribution,
+        }
+
+    def _update_stats_on_close(self, cycle: TradeCycle, attribution: dict[str, Any]) -> None:
+        if cycle.status == "fully_filled":
+            rn = attribution.get("realized_net_pct")
+            if rn is not None:
+                notional: Decimal = Decimal("0")
+                if cycle.var_leg.avg_fill_px is not None:
+                    notional = cycle.var_leg.filled_qty * cycle.var_leg.avg_fill_px
+                self.stats.cumulative_realized_net_notional += notional * Decimal(str(rn)) / Decimal("100")
+
+        comps = attribution.get("components", {})
+        alpha = 0.1
+        if comps.get("var_slippage_pct") is not None:
+            self.stats.avg_var_slippage_bps = (
+                (1 - alpha) * self.stats.avg_var_slippage_bps + alpha * float(comps["var_slippage_pct"]) * 100.0
+            )
+        if comps.get("lighter_slippage_pct") is not None:
+            self.stats.avg_lighter_slippage_bps = (
+                (1 - alpha) * self.stats.avg_lighter_slippage_bps + alpha * float(comps["lighter_slippage_pct"]) * 100.0
+            )
