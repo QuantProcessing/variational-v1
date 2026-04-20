@@ -24,6 +24,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
+from variational.journal import EventJournal
 from variational.listener import (
     HEARTBEAT_STALE_SECONDS,
     CommandBroker,
@@ -237,6 +238,8 @@ class VariationalToLighterRuntime:
 
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
+        self.signal_events_file = output_dir / "signal_events.jsonl" if output_dir else LOG_DIR / "signal_events.jsonl"
+        self.signal_journal = EventJournal(self.signal_events_file)
         self._order_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
         self._trade_records_snapshot_sig: str | None = None
@@ -890,6 +893,31 @@ class VariationalToLighterRuntime:
             return "-"
         return f"{value:.4f}%"
 
+    def _emit_signal_edge(self, direction: str, state, event: str) -> None:
+        direction_state = state.long_direction if direction == "long_var_short_lighter" else state.short_direction
+        self.signal_journal.emit(
+            {
+                "ts": utc_now(),
+                "event": event,
+                "direction": direction,
+                "asset": state.asset,
+                "adjusted_pct": decimal_to_str(direction_state.adjusted_pct),
+                "cross_spread_pct": decimal_to_str(direction_state.cross_spread_pct),
+                "book_spread_baseline_pct": decimal_to_str(state.book_spread_baseline_pct),
+                "median_5m_pct": direction_state.median_5m_pct,
+                "median_30m_pct": direction_state.median_30m_pct,
+                "median_1h_pct": direction_state.median_1h_pct,
+                "quotes": {
+                    "var_bid": decimal_to_str(state.var_bid),
+                    "var_ask": decimal_to_str(state.var_ask),
+                    "lighter_bid": decimal_to_str(state.lighter_bid),
+                    "lighter_ask": decimal_to_str(state.lighter_ask),
+                },
+                "triggered_cycle_id": None,
+                "skip_reason": None,
+            }
+        )
+
     async def render_dashboard(self) -> Group:
         var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
@@ -902,7 +930,8 @@ class VariationalToLighterRuntime:
             lighter_ask=lighter_ask,
         )
         # Edges consumed here so _prev_*_green advance; journaling/dispatch added in later tasks.
-        self.signal_engine.detect_edges()
+        for direction, event in self.signal_engine.detect_edges():
+            self._emit_signal_edge(direction, state, event=event)
 
         var_book_spread = spread_value(var_bid, var_ask)
         lighter_book_spread = spread_value(lighter_bid, lighter_ask)
@@ -1163,6 +1192,7 @@ class VariationalToLighterRuntime:
     async def run(self) -> None:
         self.setup_signal_handlers()
         await self.runtime.start()
+        await self.signal_journal.start()
         self.print_startup_next_steps()
         self.logger.info(
             "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s",
@@ -1201,6 +1231,8 @@ class VariationalToLighterRuntime:
         if self.lighter_ws_task and not self.lighter_ws_task.done():
             self.lighter_ws_task.cancel()
             await asyncio.gather(self.lighter_ws_task, return_exceptions=True)
+
+        await self.signal_journal.stop()
 
         if self.lighter_client is not None:
             close_method = getattr(self.lighter_client, "close", None)
