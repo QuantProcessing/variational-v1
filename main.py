@@ -1414,15 +1414,25 @@ class VariationalToLighterRuntime:
         if var_total is None and lig_total is None and grand_total is None:
             return None
 
+        # Cumulative per-venue traded notional from TraderStats.
+        stats = self.auto_trader.snapshot() if self.auto_trader is not None else None
+        var_vol = stats.var_volume_usd if stats is not None else None
+        lig_vol = stats.lighter_volume_usd if stats is not None else None
+        grand_vol = (
+            (var_vol + lig_vol)
+            if var_vol is not None and lig_vol is not None
+            else None
+        )
+
         if is_zh:
             title = f"账户(启动 {self.startup_ts_iso or '-'})"
             col_venue = "平台"; col_bal = "余额"; col_upnl = "浮盈"
-            col_total = "总值"; col_delta = "Δ vs 启动"
+            col_total = "总值"; col_delta = "Δ vs 启动"; col_vol = "累计交易量"
             row_grand = "合计"
         else:
             title = f"Account (anchored at {self.startup_ts_iso or '-'})"
             col_venue = "Venue"; col_bal = "Balance"; col_upnl = "uPnL"
-            col_total = "Total"; col_delta = "Δ vs start"
+            col_total = "Total"; col_delta = "Δ vs start"; col_vol = "Cum. Volume"
             row_grand = "Grand Total"
 
         tbl = Table(title=title, show_header=True, expand=True)
@@ -1431,11 +1441,12 @@ class VariationalToLighterRuntime:
         tbl.add_column(col_upnl, justify="right")
         tbl.add_column(col_total, justify="right")
         tbl.add_column(col_delta, justify="right")
+        tbl.add_column(col_vol, justify="right")
         tbl.add_row("Variational", fmt_money(var_bal), fmt_money(var_upnl),
-                    fmt_money(var_total), fmt_delta(var_delta))
+                    fmt_money(var_total), fmt_delta(var_delta), fmt_money(var_vol))
         tbl.add_row("Lighter", fmt_money(lig_bal), fmt_money(lig_upnl),
-                    fmt_money(lig_total), fmt_delta(lig_delta))
-        tbl.add_row(row_grand, "", "", fmt_money(grand_total), fmt_delta(grand_delta))
+                    fmt_money(lig_total), fmt_delta(lig_delta), fmt_money(lig_vol))
+        tbl.add_row(row_grand, "", "", fmt_money(grand_total), fmt_delta(grand_delta), fmt_money(grand_vol))
 
         border = "green" if (grand_delta is not None and grand_delta >= 0) else ("red" if grand_delta is not None else "cyan")
         return Panel(tbl, border_style=border)

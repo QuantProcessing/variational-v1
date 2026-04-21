@@ -103,6 +103,11 @@ class TraderStats:
     cumulative_realized_net_notional: Decimal = Decimal("0")
     avg_var_slippage_bps: float = 0.0
     avg_lighter_slippage_bps: float = 0.0
+    # Cumulative notional (fill_px × fill_qty) per venue across all fills
+    # since process start — useful for exchange volume-based reward tiers.
+    # Not reset on UTC day rollover.
+    var_volume_usd: Decimal = Decimal("0")
+    lighter_volume_usd: Decimal = Decimal("0")
     frozen: bool = False
     frozen_reason: str | None = None
     _day_key: str = ""
@@ -559,6 +564,7 @@ class AutoTrader:
         if side is not None:
             signed = fill_qty if side.lower() == "buy" else -fill_qty
             self._update_venue_position("var", signed, fill_px)
+            self.stats.var_volume_usd += fill_px * fill_qty
             async with self._lock:
                 self._update_mode()
         async with self._lock:
@@ -577,6 +583,7 @@ class AutoTrader:
         if side is not None:
             signed = fill_qty if side.upper() == "BUY" else -fill_qty
             self._update_venue_position("lighter", signed, fill_px)
+            self.stats.lighter_volume_usd += fill_px * fill_qty
             async with self._lock:
                 self._update_mode()
         async with self._lock:
