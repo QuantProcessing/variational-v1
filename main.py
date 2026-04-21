@@ -275,6 +275,14 @@ class VariationalPlacerImpl:
         quote_id = quote_parsed.get("quote_id") if isinstance(quote_parsed, dict) else None
         if not quote_id:
             return VarPlaceResult(ok=False, error="quote_missing_id", raw_body=quote_res.body)
+        # Extract indicative price that WE will execute at: ask if we're buying,
+        # bid if we're selling. Used by the close path to update position
+        # tracker directly since /events WS doesn't reliably push reduce-only
+        # trade events.
+        indicative_price: Decimal | None = None
+        if isinstance(quote_parsed, dict):
+            px_field = "ask" if side.lower() == "buy" else "bid"
+            indicative_price = to_decimal(quote_parsed.get(px_field))
 
         order_body = _json.dumps({
             "quote_id": quote_id,
@@ -314,6 +322,7 @@ class VariationalPlacerImpl:
         return VarPlaceResult(
             ok=True, raw_status=order_res.status, raw_body=order_res.body,
             latency_ms=order_res.latency_ms, trade_id=rfq_id, request_id=order_res.request_id,
+            fill_price=indicative_price,
         )
 
     async def place_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
