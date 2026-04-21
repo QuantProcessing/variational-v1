@@ -690,16 +690,35 @@ class AutoTrader:
 
         if self._var_pos_qty > 0:
             # Long Var, short Lighter. Close = SELL var @ var_bid + BUY lighter @ lighter_ask.
+            # To "close" this is equivalent to firing the short_var_long_lighter
+            # direction signal — so we gate on that direction's is_green.
             pnl_per_unit = (var_bid - self._var_pos_avg) + (self._lighter_pos_avg - lighter_ask)
             top_qty = lighter_ask_qty
             var_side, lighter_side = "sell", "BUY"
             closable = min(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
+            reverse_is_green_dir = "short_var_long_lighter"
         else:
             # Short Var, long Lighter. Close = BUY var @ var_ask + SELL lighter @ lighter_bid.
+            # Closing this mirrors firing long_var_short_lighter direction.
             pnl_per_unit = (self._var_pos_avg - var_ask) + (lighter_bid - self._lighter_pos_avg)
             top_qty = lighter_bid_qty
             var_side, lighter_side = "buy", "SELL"
             closable = min(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
+            reverse_is_green_dir = "long_var_short_lighter"
+
+        # Use the SignalEngine's reverse-direction green as the primary gate:
+        # only close when the cross-spread relative to its own recent history
+        # is favorable (adjusted > median_5m/30m/1h). This filters out
+        # "just-crossed-zero" noisy moments that eat pnl via execution slippage.
+        state = self.signal.get_state()
+        if state is None:
+            return
+        reverse_state = (
+            state.short_direction if reverse_is_green_dir == "short_var_long_lighter"
+            else state.long_direction
+        )
+        if not reverse_state.is_green:
+            return
 
         if pnl_per_unit < 0 or top_qty is None or top_qty <= 0:
             return
