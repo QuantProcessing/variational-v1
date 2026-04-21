@@ -19,6 +19,12 @@ from typing import Any, Optional
 from variational.journal import EventJournal
 from variational.signal import SignalEngine, SignalState
 
+# Fraction of Lighter top-of-book qty to consume per close attempt. Leaving
+# 70% on the book means competitors eating the level ahead of us only eats
+# our 30%, not pushing us to deeper/worse levels. Successive WS ticks will
+# re-fire until position is fully drained.
+CLOSE_BOOK_FRACTION = Decimal("0.3")
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -698,7 +704,10 @@ class AutoTrader:
         if pnl_per_unit < 0 or top_qty is None or top_qty <= 0:
             return
 
-        close_qty = min(closable, top_qty)
+        # Only consume 30% of Lighter top-of-book qty per attempt — competitors
+        # snapping up the level can eat ~70% without pushing us to worse levels.
+        # Successive WS ticks re-fire until position is drained.
+        close_qty = min(closable, top_qty * CLOSE_BOOK_FRACTION)
         if close_qty <= 0:
             return
 
