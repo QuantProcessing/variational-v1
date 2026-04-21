@@ -1375,8 +1375,32 @@ class VariationalToLighterRuntime:
         return Group(header, quote_table, spread_table, orders_table)
 
     async def _render_account_panel(self, is_zh: bool):
-        var_bal, var_upnl = await self.read_variational_account_snapshot()
-        lig_bal, lig_upnl = await self.read_lighter_account_snapshot()
+        var_bal, var_upnl_ws = await self.read_variational_account_snapshot()
+        lig_bal, lig_upnl_ws = await self.read_lighter_account_snapshot()
+
+        # Local uPnL estimate: qty_signed × (current_mark - avg_entry).
+        # Preferred over WS upnl because WS only pushes on account
+        # changes — if market moves without a trade, WS upnl goes stale.
+        # WS upnl is used as fallback when position accounting isn't ready.
+        var_upnl: Decimal | None = var_upnl_ws
+        lig_upnl: Decimal | None = lig_upnl_ws
+        if self.auto_trader is not None:
+            positions = self.auto_trader.get_positions()
+            var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+            async with self.lighter_order_book_lock:
+                lb, la = self.lighter_best_bid, self.lighter_best_ask
+            var_qty, var_avg = positions.get("var", (Decimal("0"), Decimal("0")))
+            lig_qty, lig_avg = positions.get("lighter", (Decimal("0"), Decimal("0")))
+            if var_qty != 0 and var_avg != 0 and var_bid is not None and var_ask is not None:
+                var_mark = (var_bid + var_ask) / Decimal("2")
+                var_upnl = var_qty * (var_mark - var_avg)
+            elif var_qty == 0:
+                var_upnl = Decimal("0")
+            if lig_qty != 0 and lig_avg != 0 and lb is not None and la is not None:
+                lig_mark = (lb + la) / Decimal("2")
+                lig_upnl = lig_qty * (lig_mark - lig_avg)
+            elif lig_qty == 0:
+                lig_upnl = Decimal("0")
 
         def total(bal: Decimal | None, upnl: Decimal | None) -> Decimal | None:
             if bal is None or upnl is None:

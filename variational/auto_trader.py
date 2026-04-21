@@ -279,17 +279,16 @@ class AutoTrader:
         return None
 
     def _update_mode(self) -> None:
-        """Recompute close-mode state based on actual venue position.
+        """Recompute close-mode state from actual filled venue positions.
 
-        Uses max(|var_pos|, |lighter_pos|, |directional_commit|) so that
-        both in-flight cycle commitments and already-filled exposure are
-        both respected. Called under self._lock.
+        We do NOT include _directional_net_qty here: that tracker only
+        increments on cycle fires and is not decremented by close fills
+        (closes don't belong to cycles), so using it would lock us in
+        close mode forever once we've accumulated to the limit. Actual
+        filled positions are the ground truth for whether we still have
+        exposure to reduce.
         """
-        abs_net = max(
-            abs(self._directional_net_qty),
-            abs(self._var_pos_qty),
-            abs(self._lighter_pos_qty),
-        )
+        abs_net = max(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
         limit = self.config.position_limit
         resume_at = limit * self.config.reduce_only_resume_fraction
         if not self._close_mode and abs_net >= limit:
@@ -594,7 +593,15 @@ class AutoTrader:
         self._apply_lighter_fill(cycle, fill_px, fill_qty)
 
     def _update_venue_position(self, venue: str, fill_qty_signed: Decimal, fill_px: Decimal) -> Decimal:
-        """Classic perpetual position accounting. Returns realized PnL delta."""
+        """Classic perpetual position accounting. Returns realized PnL delta.
+
+        Also decrements self._directional_net_qty whenever a fill SHRINKS
+        |venue_pos|. This keeps the commit-tracker in sync with actual
+        exposure after reduce-only closes (which are not cycle fires and
+        otherwise never touch _directional_net_qty), so that later
+        _gate_check projections reflect the real remaining budget.
+        Only applied on the var side to avoid double-counting both legs.
+        """
         if venue == "var":
             old_qty, old_avg = self._var_pos_qty, self._var_pos_avg
         else:
@@ -624,6 +631,18 @@ class AutoTrader:
 
         if venue == "var":
             self._var_pos_qty, self._var_pos_avg = new_qty, new_avg
+            # Keep _directional_net_qty in sync on position reductions
+            # (closes). Use var side as the authoritative sync source.
+            shrink = abs(old_qty) - abs(new_qty)
+            if shrink > 0:
+                if self._directional_net_qty > 0:
+                    self._directional_net_qty = max(
+                        Decimal("0"), self._directional_net_qty - shrink,
+                    )
+                elif self._directional_net_qty < 0:
+                    self._directional_net_qty = min(
+                        Decimal("0"), self._directional_net_qty + shrink,
+                    )
         else:
             self._lighter_pos_qty, self._lighter_pos_avg = new_qty, new_avg
         return realized
@@ -744,6 +763,17 @@ class AutoTrader:
             })
         finally:
             self._close_in_progress = False
+
+    def get_positions(self) -> dict[str, tuple[Decimal, Decimal]]:
+        """Read-only snapshot of per-venue position state.
+
+        Returns { "var": (qty_signed, avg_price), "lighter": (...) }.
+        qty is signed (+long, -short); avg_price is 0 if no position.
+        """
+        return {
+            "var": (self._var_pos_qty, self._var_pos_avg),
+            "lighter": (self._lighter_pos_qty, self._lighter_pos_avg),
+        }
 
     def peek_lighter_info(
         self, rfq_id: str
