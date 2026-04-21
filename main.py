@@ -439,8 +439,6 @@ class VariationalToLighterRuntime:
             qty=qty_dec,
             throttle_seconds=args.throttle_seconds,
             max_trades_per_day=args.max_trades_per_day,
-            var_fee_bps=args.var_fee_bps,
-            lighter_fee_bps=args.lighter_fee_bps,
             position_limit=position_limit_dec,
             leg_settle_timeout_sec=args.leg_settle_timeout_sec,
             var_order_timeout_ms=args.var_order_timeout_ms,
@@ -1355,11 +1353,10 @@ class VariationalToLighterRuntime:
 
     async def run(self) -> None:
         self.logger.info(
-            "Startup config: qty=%s throttle_s=%.1f max_trades/day=%d var_fee_bps=%.1f lighter_fee_bps=%.1f "
+            "Startup config: qty=%s throttle_s=%.1f max_trades/day=%d "
             "signal_strict=%s leg_timeout_s=%.1f var_order_timeout_ms=%d lang=%s",
             self.auto_trader_config.qty, self.auto_trader_config.throttle_seconds,
             self.auto_trader_config.max_trades_per_day,
-            self.auto_trader_config.var_fee_bps, self.auto_trader_config.lighter_fee_bps,
             self.args.signal_strict, self.auto_trader_config.leg_settle_timeout_sec,
             self.auto_trader_config.var_order_timeout_ms, self.args.lang,
         )
@@ -1406,10 +1403,10 @@ class VariationalToLighterRuntime:
             logger=self.logger,
         )
         self.logger.info(
-            "AutoTrader initialized: qty=%s throttle=%.1fs max/day=%d fees(var/lighter bps)=%.1f/%.1f",
+            "AutoTrader initialized: qty=%s throttle=%.1fs max/day=%d position_limit=%s",
             self.auto_trader_config.qty, self.auto_trader_config.throttle_seconds,
             self.auto_trader_config.max_trades_per_day,
-            self.auto_trader_config.var_fee_bps, self.auto_trader_config.lighter_fee_bps,
+            self.auto_trader_config.position_limit,
         )
 
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
@@ -1460,8 +1457,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qty", required=True, type=str, help="Per-cycle base asset qty (required). Example: 0.01")
     parser.add_argument("--throttle-seconds", type=float, default=3.0)
     parser.add_argument("--max-trades-per-day", type=int, default=200)
-    parser.add_argument("--var-fee-bps", type=float, default=0.0)
-    parser.add_argument("--lighter-fee-bps", type=float, default=2.0)
     parser.add_argument("--position-limit", type=str, default="0",
                         help="Net directional position ceiling (signed qty). At |net|>=limit "
                              "we enter reduce-only mode until |net| drops to 50%% of limit. "

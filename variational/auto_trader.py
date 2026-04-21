@@ -35,8 +35,6 @@ class AutoTraderConfig:
     qty: Decimal
     throttle_seconds: float = 3.0
     max_trades_per_day: int = 200
-    var_fee_bps: float = 0.0
-    lighter_fee_bps: float = 2.0
     position_limit: Decimal = Decimal("0")
     reduce_only_resume_fraction: Decimal = Decimal("0.5")
     leg_settle_timeout_sec: float = 10.0
@@ -310,10 +308,9 @@ class AutoTrader:
             lighter_side = "BUY"
 
         expected_gross_pct = float(ds.cross_spread_pct) if ds.cross_spread_pct is not None else None
-        total_fee_bps = self.config.var_fee_bps + self.config.lighter_fee_bps
-        expected_net_pct = None
-        if expected_gross_pct is not None:
-            expected_net_pct = expected_gross_pct - (total_fee_bps / 100.0)
+        # Both venues are zero-fee: Variational is RFQ (no taker/maker fee),
+        # Lighter basic account is 0-fee (accepts a 200ms delay). net == gross.
+        expected_net_pct = expected_gross_pct
 
         plan = TradePlan(
             qty_target=self.config.qty,
@@ -683,14 +680,12 @@ class AutoTrader:
         realized_net_pct: float | None = None
         var_slip_pct: float | None = None
         lig_slip_pct: float | None = None
-        fee_pct = (self.config.var_fee_bps + self.config.lighter_fee_bps) / 100.0
+        fee_pct = 0.0  # Zero-fee venues; key kept for schema continuity.
 
         if cycle.direction == "long_var_short_lighter" and var_avg is not None and lig_avg is not None and var_avg != 0:
-            realized_gross = float((lig_avg - var_avg) / var_avg) * 100.0
-            realized_net_pct = realized_gross - fee_pct
+            realized_net_pct = float((lig_avg - var_avg) / var_avg) * 100.0
         elif cycle.direction == "short_var_long_lighter" and var_avg is not None and lig_avg is not None and lig_avg != 0:
-            realized_gross = float((var_avg - lig_avg) / lig_avg) * 100.0
-            realized_net_pct = realized_gross - fee_pct
+            realized_net_pct = float((var_avg - lig_avg) / lig_avg) * 100.0
 
         if plan.expected_var_fill_px is not None and var_avg is not None and plan.expected_var_fill_px != 0:
             if cycle.direction == "long_var_short_lighter":
