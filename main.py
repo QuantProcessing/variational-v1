@@ -420,6 +420,16 @@ class VariationalToLighterRuntime:
         self.base_amount_multiplier = 0
         self.price_multiplier = 0
 
+        # Account equity tracking: both venues stream through WS. Variational
+        # pushes via /portfolio (already subscribed); Lighter pushes via
+        # user_stats/{account_index} on the same WS connection as order_book.
+        self.startup_ts_iso: str | None = None
+        self.startup_var_total: Decimal | None = None
+        self.startup_lighter_total: Decimal | None = None
+        self.current_lighter_balance: Decimal | None = None
+        self.current_lighter_upnl: Decimal | None = None
+        self._account_lock = asyncio.Lock()
+
         self.lighter_order_book = {"bids": {}, "asks": {}}
         self.lighter_best_bid: Decimal | None = None
         self.lighter_best_ask: Decimal | None = None
@@ -679,6 +689,9 @@ class VariationalToLighterRuntime:
                     ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
                 ) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
+                    # user_stats channel streams collateral + portfolio_value
+                    # (unauth'd per Lighter WS docs).
+                    await ws.send(json.dumps({"type": "subscribe", "channel": f"user_stats/{self.account_index}"}))
 
                     account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
                     try:
@@ -759,6 +772,17 @@ class VariationalToLighterRuntime:
                             for order in orders:
                                 await self.handle_lighter_fill_update(order)
 
+                        elif msg_type == "update/user_stats":
+                            stats = data.get("stats") or {}
+                            coll = to_decimal(stats.get("collateral"))
+                            port = to_decimal(stats.get("portfolio_value"))
+                            # upnl = portfolio_value - collateral (Lighter's own definition).
+                            if coll is not None:
+                                async with self._account_lock:
+                                    self.current_lighter_balance = coll
+                                    if port is not None:
+                                        self.current_lighter_upnl = port - coll
+
                         if self.lighter_order_book_sequence_gap:
                             await self.request_fresh_snapshot(ws)
                             self.lighter_order_book_sequence_gap = False
@@ -779,6 +803,51 @@ class VariationalToLighterRuntime:
     async def get_lighter_best_bid_ask(self) -> tuple[Decimal | None, Decimal | None]:
         async with self.lighter_order_book_lock:
             return self.lighter_best_bid, self.lighter_best_ask
+
+    async def read_variational_account_snapshot(self) -> tuple[Decimal | None, Decimal | None]:
+        """Read balance / upnl from the /portfolio WS cache. Returns (balance, upnl)."""
+        async with self.runtime.monitor._lock:
+            pf = self.runtime.monitor.portfolio_summary or {}
+            return to_decimal(pf.get("balance")), to_decimal(pf.get("upnl"))
+
+    async def read_lighter_account_snapshot(self) -> tuple[Decimal | None, Decimal | None]:
+        async with self._account_lock:
+            return self.current_lighter_balance, self.current_lighter_upnl
+
+    async def _capture_startup_account_snapshot(self, timeout: float) -> None:
+        """Wait up to `timeout` seconds for both venues' account streams to
+        push first data, then anchor startup_*_total for delta display."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            var_bal, var_upnl = await self.read_variational_account_snapshot()
+            lig_bal, lig_upnl = await self.read_lighter_account_snapshot()
+            var_ok = var_bal is not None and var_upnl is not None
+            lig_ok = lig_bal is not None and lig_upnl is not None
+            if var_ok and lig_ok:
+                self.startup_var_total = var_bal + var_upnl
+                self.startup_lighter_total = lig_bal + lig_upnl
+                self.startup_ts_iso = utc_now()
+                self.logger.info(
+                    "Startup equity: var_total=%s lighter_total=%s grand=%s",
+                    self.startup_var_total, self.startup_lighter_total,
+                    self.startup_var_total + self.startup_lighter_total,
+                )
+                return
+            await asyncio.sleep(0.2)
+        # Partial anchoring if either side arrived; otherwise leave as None
+        # and the dashboard panel will show "-" until WS pushes land.
+        var_bal, var_upnl = await self.read_variational_account_snapshot()
+        lig_bal, lig_upnl = await self.read_lighter_account_snapshot()
+        if var_bal is not None and var_upnl is not None:
+            self.startup_var_total = var_bal + var_upnl
+        if lig_bal is not None and lig_upnl is not None:
+            self.startup_lighter_total = lig_bal + lig_upnl
+        if self.startup_var_total is not None or self.startup_lighter_total is not None:
+            self.startup_ts_iso = utc_now()
+        self.logger.warning(
+            "Startup account snapshot incomplete after %.1fs: var=%s lighter=%s",
+            timeout, self.startup_var_total, self.startup_lighter_total,
+        )
 
     async def get_variational_best_bid_ask(self, preferred_asset: str | None):
         async with self.runtime.monitor._lock:
@@ -1251,8 +1320,77 @@ class VariationalToLighterRuntime:
                     f"breaker: {'OK' if not stats.frozen else 'FROZEN'}{frozen_suffix}{drop_suffix}"
                 )
             stats_panel = Panel(stats_line, border_style=("red" if stats.frozen else "green"))
+            account_panel = await self._render_account_panel(is_zh)
+            if account_panel is not None:
+                return Group(header, quote_table, spread_table, orders_table, stats_panel, account_panel)
             return Group(header, quote_table, spread_table, orders_table, stats_panel)
         return Group(header, quote_table, spread_table, orders_table)
+
+    async def _render_account_panel(self, is_zh: bool):
+        var_bal, var_upnl = await self.read_variational_account_snapshot()
+        lig_bal, lig_upnl = await self.read_lighter_account_snapshot()
+
+        def total(bal: Decimal | None, upnl: Decimal | None) -> Decimal | None:
+            if bal is None or upnl is None:
+                return None
+            return bal + upnl
+
+        def fmt_money(v: Decimal | None) -> str:
+            if v is None:
+                return "-"
+            return f"{v:.4f}"
+
+        def fmt_delta(v: Decimal | None) -> str:
+            if v is None:
+                return "-"
+            sign = "+" if v >= 0 else ""
+            return f"{sign}{v:.4f}"
+
+        var_total = total(var_bal, var_upnl)
+        lig_total = total(lig_bal, lig_upnl)
+        var_delta = (var_total - self.startup_var_total) if var_total is not None and self.startup_var_total is not None else None
+        lig_delta = (lig_total - self.startup_lighter_total) if lig_total is not None and self.startup_lighter_total is not None else None
+        grand_total = (var_total + lig_total) if var_total is not None and lig_total is not None else None
+        startup_grand = (
+            (self.startup_var_total + self.startup_lighter_total)
+            if self.startup_var_total is not None and self.startup_lighter_total is not None
+            else None
+        )
+        grand_delta = (
+            (grand_total - startup_grand)
+            if grand_total is not None and startup_grand is not None
+            else None
+        )
+
+        # Nothing to show yet
+        if var_total is None and lig_total is None and grand_total is None:
+            return None
+
+        if is_zh:
+            title = f"账户(启动 {self.startup_ts_iso or '-'})"
+            col_venue = "平台"; col_bal = "余额"; col_upnl = "浮盈"
+            col_total = "总值"; col_delta = "Δ vs 启动"
+            row_grand = "合计"
+        else:
+            title = f"Account (anchored at {self.startup_ts_iso or '-'})"
+            col_venue = "Venue"; col_bal = "Balance"; col_upnl = "uPnL"
+            col_total = "Total"; col_delta = "Δ vs start"
+            row_grand = "Grand Total"
+
+        tbl = Table(title=title, show_header=True, expand=True)
+        tbl.add_column(col_venue, style="bold")
+        tbl.add_column(col_bal, justify="right")
+        tbl.add_column(col_upnl, justify="right")
+        tbl.add_column(col_total, justify="right")
+        tbl.add_column(col_delta, justify="right")
+        tbl.add_row("Variational", fmt_money(var_bal), fmt_money(var_upnl),
+                    fmt_money(var_total), fmt_delta(var_delta))
+        tbl.add_row("Lighter", fmt_money(lig_bal), fmt_money(lig_upnl),
+                    fmt_money(lig_total), fmt_delta(lig_delta))
+        tbl.add_row(row_grand, "", "", fmt_money(grand_total), fmt_delta(grand_delta))
+
+        border = "green" if (grand_delta is not None and grand_delta >= 0) else ("red" if grand_delta is not None else "cyan")
+        return Panel(tbl, border_style=border)
 
     async def export_trade_records_csv(self) -> None:
         if self.trade_records_csv_file is None:
@@ -1411,6 +1549,11 @@ class VariationalToLighterRuntime:
 
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
         self.logger.info("Tracking new Variational trade events from seq>%s", self.trade_event_cursor)
+
+        # Wait briefly for both account streams to push their first data so we
+        # can anchor a startup equity snapshot. Each WS pushes an initial
+        # message within 1-2s; give it 5s and accept None if either is slow.
+        await self._capture_startup_account_snapshot(timeout=5.0)
 
         self.trade_task = asyncio.create_task(self.trade_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
