@@ -108,6 +108,12 @@ class TraderStats:
     # Not reset on UTC day rollover.
     var_volume_usd: Decimal = Decimal("0")
     lighter_volume_usd: Decimal = Decimal("0")
+    # Cumulative realized P&L per venue, computed locally from the fill
+    # stream (sum of per-fill realized deltas from _update_venue_position).
+    # Don't trust venues' `balance`/`collateral` fields to reflect this —
+    # Variational's balance tracks realized, Lighter's collateral does not.
+    var_realized_pnl: Decimal = Decimal("0")
+    lighter_realized_pnl: Decimal = Decimal("0")
     frozen: bool = False
     frozen_reason: str | None = None
     _day_key: str = ""
@@ -562,8 +568,9 @@ class AutoTrader:
         """
         if side is not None:
             signed = fill_qty if side.lower() == "buy" else -fill_qty
-            self._update_venue_position("var", signed, fill_px)
+            realized = self._update_venue_position("var", signed, fill_px)
             self.stats.var_volume_usd += fill_px * fill_qty
+            self.stats.var_realized_pnl += realized
             async with self._lock:
                 self._update_mode()
         async with self._lock:
@@ -581,8 +588,9 @@ class AutoTrader:
     ) -> None:
         if side is not None:
             signed = fill_qty if side.upper() == "BUY" else -fill_qty
-            self._update_venue_position("lighter", signed, fill_px)
+            realized = self._update_venue_position("lighter", signed, fill_px)
             self.stats.lighter_volume_usd += fill_px * fill_qty
+            self.stats.lighter_realized_pnl += realized
             async with self._lock:
                 self._update_mode()
         async with self._lock:
