@@ -130,6 +130,7 @@ class LighterAdapter(Protocol):
         qty: Decimal,
         limit_px: Decimal,
         client_order_id: int,
+        reduce_only: bool = False,
     ) -> "LighterPlaceResult": ...
 
 
@@ -143,6 +144,14 @@ class LighterPlaceResult:
 
 class VariationalPlacer(Protocol):
     async def place_order(
+        self,
+        side: str,
+        qty: Decimal,
+        asset: str,
+        timeout_ms: int,
+    ) -> "VarPlaceResult": ...
+
+    async def place_close_order(
         self,
         side: str,
         qty: Decimal,
@@ -197,11 +206,19 @@ class AutoTrader:
         # that cancelled/partial cycles don't lock the accumulator permanently.
         self._directional_net_qty: Decimal = Decimal("0")
         self._cycle_signed_qty: dict[str, Decimal] = {}
-        # Hysteresis: once |net_qty| reaches position_limit we flip into
-        # reduce-only mode (reject any fire that doesn't strictly shrink
-        # |net_qty|). We stay in reduce-only until |net_qty| drops below
+        # Hysteresis: once |net_qty| reaches position_limit we enter close mode
+        # (signal fires paused; WS ticks drive active reduce-only closes when
+        # close PnL >= 0). Exit close mode when |net_qty| drops below
         # position_limit * reduce_only_resume_fraction (default 50%).
-        self._reduce_only_mode = False
+        self._close_mode = False
+        self._close_in_progress = False
+
+        # Per-venue position accounting for close PnL computation.
+        # _*_pos_qty is signed (+long, -short). avg is cost basis (unsigned).
+        self._var_pos_qty: Decimal = Decimal("0")
+        self._var_pos_avg: Decimal = Decimal("0")
+        self._lighter_pos_qty: Decimal = Decimal("0")
+        self._lighter_pos_avg: Decimal = Decimal("0")
 
         if self.config.position_limit == 0:
             self.config.position_limit = self.config.qty * Decimal("2")
@@ -245,37 +262,43 @@ class AutoTrader:
 
         # Position-limit hysteresis:
         # - normal mode: reject if projected |net| would exceed position_limit
-        # - reduce-only mode: reject any fire that doesn't strictly shrink |net|
+        # - close mode: reject ALL signal fires (closes happen via WS-driven
+        #   try_close_on_book_tick, not via the signal).
+        if self._close_mode:
+            return "close_mode"
         signed = self.config.qty if direction == "long_var_short_lighter" else -self.config.qty
         current = self._directional_net_qty
         projected = current + signed
-        if self._reduce_only_mode:
-            if abs(projected) >= abs(current):
-                return "reduce_only_mode"
-        else:
-            if abs(projected) > self.config.position_limit:
-                return "position_limit_exceeded"
+        if abs(projected) > self.config.position_limit:
+            return "position_limit_exceeded"
         return None
 
     def _update_mode(self) -> None:
-        """Recompute reduce-only state based on current _directional_net_qty.
+        """Recompute close-mode state based on actual venue position.
 
-        Must be called while holding self._lock (callers already do).
+        Uses max(|var_pos|, |lighter_pos|, |directional_commit|) so that
+        both in-flight cycle commitments and already-filled exposure are
+        both respected. Called under self._lock.
         """
-        abs_net = abs(self._directional_net_qty)
+        abs_net = max(
+            abs(self._directional_net_qty),
+            abs(self._var_pos_qty),
+            abs(self._lighter_pos_qty),
+        )
         limit = self.config.position_limit
         resume_at = limit * self.config.reduce_only_resume_fraction
-        if not self._reduce_only_mode and abs_net >= limit:
-            self._reduce_only_mode = True
+        if not self._close_mode and abs_net >= limit:
+            self._close_mode = True
             self.logger.warning(
-                "Entering reduce-only mode: net=%s limit=%s. "
-                "Only opposite-direction fires allowed until |net| <= %s.",
+                "Entering close mode: net=%s limit=%s. Signal fires paused; "
+                "WS ticks drive reduce-only closes when close_pnl >= 0 "
+                "until |net| <= %s.",
                 self._directional_net_qty, limit, resume_at,
             )
-        elif self._reduce_only_mode and abs_net <= resume_at:
-            self._reduce_only_mode = False
+        elif self._close_mode and abs_net <= resume_at:
+            self._close_mode = False
             self.logger.info(
-                "Exiting reduce-only mode: net=%s resume_at=%s. Resuming normal cycle dispatch.",
+                "Exiting close mode: net=%s resume_at=%s. Resuming normal cycle dispatch.",
                 self._directional_net_qty, resume_at,
             )
 
@@ -524,8 +547,20 @@ class AutoTrader:
         self.logger.warning("Breaker tripped: %s (consecutive=%d daily=%d)",
                             reason, self.stats.consecutive_failures, self.stats.failures_today)
 
-    async def on_variational_fill(self, trade_id: str, fill_px: Decimal, fill_qty: Decimal) -> None:
-        """Route a Variational fill (from monitor) to an open cycle by trade_id."""
+    async def on_variational_fill(
+        self, trade_id: str, fill_px: Decimal, fill_qty: Decimal, side: str | None = None,
+    ) -> None:
+        """Route a Variational fill (from monitor) to an open cycle by trade_id.
+
+        Updates per-venue position accounting unconditionally (regardless of
+        whether the fill belongs to a tracked cycle or to a close order),
+        then routes to a cycle if the correlation key matches.
+        """
+        if side is not None:
+            signed = fill_qty if side.lower() == "buy" else -fill_qty
+            self._update_venue_position("var", signed, fill_px)
+            async with self._lock:
+                self._update_mode()
         async with self._lock:
             target: TradeCycle | None = None
             for cycle in self._open_cycles.values():
@@ -536,13 +571,172 @@ class AutoTrader:
             return
         self._apply_var_fill(target, fill_px, fill_qty)
 
-    async def on_lighter_fill(self, client_order_id: int, fill_px: Decimal, fill_qty: Decimal) -> None:
+    async def on_lighter_fill(
+        self, client_order_id: int, fill_px: Decimal, fill_qty: Decimal, side: str | None = None,
+    ) -> None:
+        if side is not None:
+            signed = fill_qty if side.upper() == "BUY" else -fill_qty
+            self._update_venue_position("lighter", signed, fill_px)
+            async with self._lock:
+                self._update_mode()
         async with self._lock:
             cycle_id = self._lighter_order_to_cycle.get(client_order_id)
             cycle = self._open_cycles.get(cycle_id) if cycle_id else None
         if cycle is None:
             return
         self._apply_lighter_fill(cycle, fill_px, fill_qty)
+
+    def _update_venue_position(self, venue: str, fill_qty_signed: Decimal, fill_px: Decimal) -> Decimal:
+        """Classic perpetual position accounting. Returns realized PnL delta."""
+        if venue == "var":
+            old_qty, old_avg = self._var_pos_qty, self._var_pos_avg
+        else:
+            old_qty, old_avg = self._lighter_pos_qty, self._lighter_pos_avg
+
+        new_qty = old_qty + fill_qty_signed
+        realized = Decimal("0")
+
+        if old_qty == 0:
+            new_avg = fill_px
+        elif (old_qty > 0) == (fill_qty_signed > 0):
+            # same direction — weighted average cost
+            new_avg = (abs(old_qty) * old_avg + abs(fill_qty_signed) * fill_px) / abs(new_qty)
+        else:
+            # opposite — realize P&L on the overlap
+            close_qty = min(abs(old_qty), abs(fill_qty_signed))
+            if old_qty > 0:
+                realized = close_qty * (fill_px - old_avg)
+            else:
+                realized = close_qty * (old_avg - fill_px)
+            if new_qty == 0:
+                new_avg = Decimal("0")
+            elif (new_qty > 0) != (old_qty > 0):
+                new_avg = fill_px      # flipped side — new position starts at fill_px
+            else:
+                new_avg = old_avg      # partial close — basis unchanged
+
+        if venue == "var":
+            self._var_pos_qty, self._var_pos_avg = new_qty, new_avg
+        else:
+            self._lighter_pos_qty, self._lighter_pos_avg = new_qty, new_avg
+        return realized
+
+    # ---------- WS-driven active close (close mode) ----------
+
+    async def try_close_on_book_tick(
+        self,
+        asset: str,
+        var_bid: Decimal | None, var_ask: Decimal | None,
+        lighter_bid: Decimal | None, lighter_ask: Decimal | None,
+        lighter_bid_qty: Decimal | None, lighter_ask_qty: Decimal | None,
+    ) -> None:
+        """Called on every Lighter order-book WS update. If we're in close
+        mode AND closing now at taker prices would yield non-negative PnL
+        AND Lighter has book depth to execute, fire a reduce-only close on
+        both venues sized to the Lighter top book qty (or remaining net,
+        whichever is smaller).
+        """
+        if not self._close_mode or self._close_in_progress:
+            return
+        if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
+            return
+        # Use actual filled venue positions, NOT _directional_net_qty (which is
+        # commit-based and doesn't reflect fills). We require BOTH venues to
+        # have a position to meaningfully close a paired leg.
+        if self._var_pos_qty == 0 or self._lighter_pos_qty == 0:
+            return
+        if self._var_pos_avg == 0 or self._lighter_pos_avg == 0:
+            return
+
+        if self._var_pos_qty > 0:
+            # Long Var, short Lighter. Close = SELL var @ var_bid + BUY lighter @ lighter_ask.
+            pnl_per_unit = (var_bid - self._var_pos_avg) + (self._lighter_pos_avg - lighter_ask)
+            top_qty = lighter_ask_qty
+            var_side, lighter_side = "sell", "BUY"
+            closable = min(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
+        else:
+            # Short Var, long Lighter. Close = BUY var @ var_ask + SELL lighter @ lighter_bid.
+            pnl_per_unit = (self._var_pos_avg - var_ask) + (lighter_bid - self._lighter_pos_avg)
+            top_qty = lighter_bid_qty
+            var_side, lighter_side = "buy", "SELL"
+            closable = min(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
+
+        if pnl_per_unit < 0 or top_qty is None or top_qty <= 0:
+            return
+
+        close_qty = min(closable, top_qty)
+        if close_qty <= 0:
+            return
+
+        self._close_in_progress = True
+        asyncio.create_task(self._execute_close(
+            asset=asset, qty=close_qty,
+            var_side=var_side, lighter_side=lighter_side,
+            lighter_bid=lighter_bid, lighter_ask=lighter_ask,
+            est_pnl_per_unit=pnl_per_unit,
+        ))
+
+    async def _execute_close(
+        self, *,
+        asset: str, qty: Decimal,
+        var_side: str, lighter_side: str,
+        lighter_bid: Decimal, lighter_ask: Decimal,
+        est_pnl_per_unit: Decimal,
+    ) -> None:
+        t0_iso = _utc_now_iso()
+        self.events.emit({
+            "ts": t0_iso, "event": "close_attempt",
+            "asset": asset, "qty": _dec_str(qty),
+            "var_side": var_side, "lighter_side": lighter_side,
+            "est_pnl_per_unit": _dec_str(est_pnl_per_unit),
+            "var_pos_before": _dec_str(self._var_pos_qty),
+            "lighter_pos_before": _dec_str(self._lighter_pos_qty),
+        })
+        try:
+            # Pre-allocate Lighter client_order_id; slippage-buffered limit.
+            slippage = Decimal(str(self.config.hedge_slippage_bps)) / Decimal("10000")
+            if lighter_side == "BUY":
+                limit_px = lighter_ask * (Decimal("1") + slippage)
+            else:
+                limit_px = lighter_bid * (Decimal("1") - slippage)
+            import time as _time
+            co_id = int(_time.time() * 1000)
+            async with self._lock:
+                while co_id in self._lighter_order_to_cycle:
+                    co_id += 1
+
+            # Fire both legs in parallel; both reduce-only.
+            var_task = asyncio.create_task(self.var_placer.place_close_order(
+                side=var_side, qty=qty, asset=asset,
+                timeout_ms=self.config.var_order_timeout_ms,
+            ))
+            lighter_task = asyncio.create_task(self.lighter.place_order(
+                side=lighter_side, qty=qty, limit_px=limit_px,
+                client_order_id=co_id, reduce_only=True,
+            ))
+            var_res, lig_res = await asyncio.gather(var_task, lighter_task, return_exceptions=True)
+
+            self.events.emit({
+                "ts": _utc_now_iso(), "event": "close_ack",
+                "qty": _dec_str(qty),
+                "var_ok": getattr(var_res, "ok", False) if not isinstance(var_res, Exception) else False,
+                "var_error": (str(var_res) if isinstance(var_res, Exception)
+                              else getattr(var_res, "error", None)),
+                "lighter_ok": getattr(lig_res, "ok", False) if not isinstance(lig_res, Exception) else False,
+                "lighter_error": (str(lig_res) if isinstance(lig_res, Exception)
+                                  else getattr(lig_res, "error", None)),
+            })
+            # Fills will flow back via on_var_fill / on_lighter_fill, which
+            # call _update_venue_position. Position accounting then shrinks
+            # _directional_net_qty via _update_mode on each fill — which may
+            # exit close mode if |net| drops below resume_at.
+        except Exception as exc:
+            self.events.emit({
+                "ts": _utc_now_iso(), "event": "close_error",
+                "error_msg": str(exc),
+            })
+        finally:
+            self._close_in_progress = False
 
     def peek_lighter_info(
         self, rfq_id: str

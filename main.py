@@ -51,6 +51,7 @@ FORWARDER_REST_PORT = 8767
 FORWARDER_COMMAND_PORT = 8768
 VAR_QUOTE_URL = "https://omni.variational.io/api/quotes/indicative"
 VAR_NEW_MARKET_URL = "https://omni.variational.io/api/orders/new/market"
+VAR_QUOTE_ACCEPT_URL = "https://omni.variational.io/api/quotes/accept"
 # Variational perpetual futures on omni.variational.io are all hourly-funded,
 # USDC-settled. If Variational adds products outside that shape, make these
 # overrides per-asset.
@@ -239,7 +240,10 @@ class VariationalPlacerImpl:
         self.max_slippage = max_slippage
         self.logger = logger
 
-    async def place_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
+    async def _rfq_then_submit(
+        self, side: str, qty: Decimal, asset: str, timeout_ms: int,
+        submit_url: str, is_reduce_only: bool,
+    ) -> VarPlaceResult:
         import json as _json
 
         qty_str = format(qty, "f")
@@ -253,16 +257,13 @@ class VariationalPlacerImpl:
             "qty": qty_str,
         })
         quote_res = await self.cmd.execute_fetch(
-            url=VAR_QUOTE_URL,
-            method="POST",
+            url=VAR_QUOTE_URL, method="POST",
             headers={"content-type": "application/json"},
-            body=indicative_body,
-            timeout_ms=timeout_ms,
+            body=indicative_body, timeout_ms=timeout_ms,
         )
         if not quote_res.ok or (quote_res.status is not None and quote_res.status >= 400):
             return VarPlaceResult(
-                ok=False,
-                raw_status=quote_res.status, raw_body=quote_res.body,
+                ok=False, raw_status=quote_res.status, raw_body=quote_res.body,
                 latency_ms=quote_res.latency_ms,
                 error=quote_res.error or f"quote_http_{quote_res.status}",
                 request_id=quote_res.request_id,
@@ -279,19 +280,16 @@ class VariationalPlacerImpl:
             "quote_id": quote_id,
             "side": side,
             "max_slippage": self.max_slippage,
-            "is_reduce_only": False,
+            "is_reduce_only": is_reduce_only,
         })
         order_res = await self.cmd.execute_fetch(
-            url=VAR_NEW_MARKET_URL,
-            method="POST",
+            url=submit_url, method="POST",
             headers={"content-type": "application/json"},
-            body=order_body,
-            timeout_ms=timeout_ms,
+            body=order_body, timeout_ms=timeout_ms,
         )
         if not order_res.ok or (order_res.status is not None and order_res.status >= 400):
             return VarPlaceResult(
-                ok=False,
-                raw_status=order_res.status, raw_body=order_res.body,
+                ok=False, raw_status=order_res.status, raw_body=order_res.body,
                 latency_ms=order_res.latency_ms,
                 error=order_res.error or f"order_http_{order_res.status}",
                 request_id=order_res.request_id,
@@ -318,6 +316,20 @@ class VariationalPlacerImpl:
             latency_ms=order_res.latency_ms, trade_id=rfq_id, request_id=order_res.request_id,
         )
 
+    async def place_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
+        """Open a new position via /api/orders/new/market (is_reduce_only: false)."""
+        return await self._rfq_then_submit(
+            side, qty, asset, timeout_ms,
+            submit_url=VAR_NEW_MARKET_URL, is_reduce_only=False,
+        )
+
+    async def place_close_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
+        """Reduce an existing position via /api/quotes/accept (is_reduce_only: true)."""
+        return await self._rfq_then_submit(
+            side, qty, asset, timeout_ms,
+            submit_url=VAR_QUOTE_ACCEPT_URL, is_reduce_only=True,
+        )
+
 
 class LighterAdapterImpl:
     def __init__(self, runtime: "VariationalToLighterRuntime") -> None:
@@ -328,6 +340,7 @@ class LighterAdapterImpl:
 
     async def place_order(
         self, side: str, qty: Decimal, limit_px: Decimal, client_order_id: int,
+        reduce_only: bool = False,
     ) -> LighterPlaceResult:
         runtime = self.runtime
         base_amount = int(qty * runtime.base_amount_multiplier)
@@ -348,7 +361,7 @@ class LighterAdapterImpl:
                     is_ask=is_ask,
                     order_type=runtime.lighter_client.ORDER_TYPE_LIMIT,
                     time_in_force=runtime.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                    reduce_only=False,
+                    reduce_only=reduce_only,
                     trigger_price=0,
                 )
             if error is not None:
@@ -433,6 +446,8 @@ class VariationalToLighterRuntime:
         self.lighter_order_book = {"bids": {}, "asks": {}}
         self.lighter_best_bid: Decimal | None = None
         self.lighter_best_ask: Decimal | None = None
+        self.lighter_best_bid_qty: Decimal | None = None
+        self.lighter_best_ask_qty: Decimal | None = None
         self.lighter_order_book_offset = 0
         self.lighter_order_book_ready = False
         self.lighter_snapshot_loaded = False
@@ -628,6 +643,45 @@ class VariationalToLighterRuntime:
     def validate_order_book_offset(self, new_offset: int) -> bool:
         return new_offset > self.lighter_order_book_offset
 
+    def _refresh_lighter_best_locked(self) -> None:
+        """Recompute best bid/ask + their top-of-book qty. Must be called
+        under self.lighter_order_book_lock."""
+        bids = self.lighter_order_book["bids"]
+        asks = self.lighter_order_book["asks"]
+        if bids:
+            best_bid = max(bids.keys())
+            self.lighter_best_bid = best_bid
+            self.lighter_best_bid_qty = bids.get(best_bid)
+        else:
+            self.lighter_best_bid = None
+            self.lighter_best_bid_qty = None
+        if asks:
+            best_ask = min(asks.keys())
+            self.lighter_best_ask = best_ask
+            self.lighter_best_ask_qty = asks.get(best_ask)
+        else:
+            self.lighter_best_ask = None
+            self.lighter_best_ask_qty = None
+
+    async def _trigger_close_on_book_tick(self) -> None:
+        """After a Lighter book update, give AutoTrader a chance to fire a
+        WS-driven reduce-only close. Uses cached Variational quote as an
+        estimate; the actual close path requests a fresh RFQ."""
+        if self.auto_trader is None:
+            return
+        var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+        async with self.lighter_order_book_lock:
+            lb = self.lighter_best_bid
+            la = self.lighter_best_ask
+            lbq = self.lighter_best_bid_qty
+            laq = self.lighter_best_ask_qty
+        await self.auto_trader.try_close_on_book_tick(
+            asset=self.variational_ticker or "",
+            var_bid=var_bid, var_ask=var_ask,
+            lighter_bid=lb, lighter_ask=la,
+            lighter_bid_qty=lbq, lighter_ask_qty=laq,
+        )
+
     async def request_fresh_snapshot(self, ws: Any) -> None:
         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
@@ -653,7 +707,11 @@ class VariationalToLighterRuntime:
         # that is gated on the legacy lookup (which fails under the new
         # AutoTrader-driven flow since place_lighter_order is gone).
         if self.auto_trader is not None and fill_price is not None and filled_base is not None:
-            await self.auto_trader.on_lighter_fill(client_order_id, fill_price, filled_base)
+            # Lighter order: is_ask True -> sell, False -> buy.
+            side = "SELL" if order.get("is_ask") else "BUY"
+            await self.auto_trader.on_lighter_fill(
+                client_order_id, fill_price, filled_base, side=side,
+            )
 
         now_iso = utc_now()
 
@@ -733,16 +791,8 @@ class VariationalToLighterRuntime:
                                 self.update_lighter_order_book("asks", order_book.get("asks", []))
                                 self.lighter_snapshot_loaded = True
                                 self.lighter_order_book_ready = True
-                                self.lighter_best_bid = (
-                                    max(self.lighter_order_book["bids"].keys())
-                                    if self.lighter_order_book["bids"]
-                                    else None
-                                )
-                                self.lighter_best_ask = (
-                                    min(self.lighter_order_book["asks"].keys())
-                                    if self.lighter_order_book["asks"]
-                                    else None
-                                )
+                                self._refresh_lighter_best_locked()
+                            await self._trigger_close_on_book_tick()
 
                         elif msg_type == "update/order_book" and self.lighter_snapshot_loaded:
                             order_book = data.get("order_book", {})
@@ -756,16 +806,8 @@ class VariationalToLighterRuntime:
                                     self.update_lighter_order_book("bids", order_book.get("bids", []))
                                     self.update_lighter_order_book("asks", order_book.get("asks", []))
                                     self.lighter_order_book_offset = new_offset
-                                    self.lighter_best_bid = (
-                                        max(self.lighter_order_book["bids"].keys())
-                                        if self.lighter_order_book["bids"]
-                                        else None
-                                    )
-                                    self.lighter_best_ask = (
-                                        min(self.lighter_order_book["asks"].keys())
-                                        if self.lighter_order_book["asks"]
-                                        else None
-                                    )
+                                    self._refresh_lighter_best_locked()
+                            await self._trigger_close_on_book_tick()
 
                         elif msg_type == "update/account_orders":
                             orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
@@ -972,7 +1014,10 @@ class VariationalToLighterRuntime:
             rfq_id = event.get("rfq_id")
             correlation_key = rfq_id or str(event.get("trade_id", "")).strip() or None
             if fill_px is not None and fill_qty_new is not None and correlation_key:
-                await self.auto_trader.on_variational_fill(correlation_key, fill_px, fill_qty_new)
+                var_side = str(event.get("side", "")).strip().lower() or None
+                await self.auto_trader.on_variational_fill(
+                    correlation_key, fill_px, fill_qty_new, side=var_side,
+                )
 
             # Bridge AutoTrader's cycle state into the legacy OrderLifecycle so the
             # dashboard's "recent orders" table and trade_records.csv can show
