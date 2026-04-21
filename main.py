@@ -814,7 +814,10 @@ class VariationalToLighterRuntime:
                             for order in orders:
                                 await self.handle_lighter_fill_update(order)
 
-                        elif msg_type == "update/user_stats":
+                        elif msg_type in ("update/user_stats", "subscribed/user_stats"):
+                            # Lighter sends `subscribed/user_stats` as the initial
+                            # snapshot, then `update/user_stats` on subsequent
+                            # account changes. Both have the same `stats` shape.
                             stats = data.get("stats") or {}
                             coll = to_decimal(stats.get("collateral"))
                             port = to_decimal(stats.get("portfolio_value"))
