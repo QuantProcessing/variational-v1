@@ -159,6 +159,10 @@ class LighterAdapter(Protocol):
         client_order_id: int,
         reduce_only: bool = False,
     ) -> "LighterPlaceResult": ...
+    async def get_position(self, symbol: str) -> Decimal | None:
+        """Return signed Lighter position qty for `symbol` (+long, -short).
+        None on fetch failure."""
+        ...
 
 
 @dataclass(slots=True)
@@ -185,6 +189,11 @@ class VariationalPlacer(Protocol):
         asset: str,
         timeout_ms: int,
     ) -> "VarPlaceResult": ...
+
+    async def get_position(self, asset: str) -> Decimal | None:
+        """Return signed Variational position qty for `asset` (+long, -short).
+        None on fetch failure."""
+        ...
 
 
 @dataclass(slots=True)
@@ -694,9 +703,14 @@ class AutoTrader:
         if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
             return
         # Use actual filled venue positions, NOT _directional_net_qty (which is
-        # commit-based and doesn't reflect fills). We require BOTH venues to
-        # have a position to meaningfully close a paired leg.
+        # commit-based and doesn't reflect fills).
+        # If one side is 0, paired close is impossible. Kick off a residual
+        # handler that queries actual positions from both venues and fires a
+        # single-venue reduce-only close on whichever side still has inventory.
         if self._var_pos_qty == 0 or self._lighter_pos_qty == 0:
+            if not self._close_in_progress:
+                self._close_in_progress = True
+                asyncio.create_task(self._handle_close_mode_residual(asset))
             return
         if self._var_pos_avg == 0 or self._lighter_pos_avg == 0:
             return
@@ -815,6 +829,113 @@ class AutoTrader:
             })
         finally:
             self._close_in_progress = False
+
+    async def _handle_close_mode_residual(self, asset: str) -> None:
+        """Called when close_mode sees one venue at 0. Queries actual positions
+        from both venues and fires a single-venue reduce-only close on whichever
+        side still has inventory. Syncs tracker to match reality afterward."""
+        try:
+            var_actual = await self.var_placer.get_position(asset)
+            lig_actual = await self.lighter.get_position(asset)
+            self.events.emit({
+                "ts": _utc_now_iso(), "event": "close_residual_probe",
+                "var_actual": _dec_str(var_actual),
+                "lighter_actual": _dec_str(lig_actual),
+                "var_tracker": _dec_str(self._var_pos_qty),
+                "lighter_tracker": _dec_str(self._lighter_pos_qty),
+            })
+            if var_actual is None or lig_actual is None:
+                self.logger.warning("residual probe failed: var=%s lighter=%s",
+                                    var_actual, lig_actual)
+                return
+
+            # Sync tracker to reality before acting.
+            self._var_pos_qty = var_actual
+            self._lighter_pos_qty = lig_actual
+
+            var_abs = abs(var_actual)
+            lig_abs = abs(lig_actual)
+
+            if var_abs == 0 and lig_abs == 0:
+                # Both flat — just exit close_mode via _update_mode re-check
+                async with self._lock:
+                    self._update_mode()
+                return
+
+            # Fire single-venue close on the heavier / non-zero side
+            if var_abs > 0 and lig_abs == 0:
+                await self._close_var_residual(asset, var_actual)
+            elif lig_abs > 0 and var_abs == 0:
+                await self._close_lighter_residual(asset, lig_actual)
+            else:
+                # Both non-zero but tracker showed one as 0 — drift case.
+                # Let normal paired close resume next tick now that tracker synced.
+                async with self._lock:
+                    self._update_mode()
+        finally:
+            self._close_in_progress = False
+
+    async def _close_var_residual(self, asset: str, residual_qty: Decimal) -> None:
+        """Single-venue Var reduce-only close for `residual_qty` signed."""
+        qty = quantize_qty(abs(residual_qty))
+        if qty <= 0:
+            return
+        # If long, SELL to close. If short, BUY to close.
+        side = "sell" if residual_qty > 0 else "buy"
+        self.events.emit({
+            "ts": _utc_now_iso(), "event": "residual_close_var",
+            "asset": asset, "side": side, "qty": _dec_str(qty),
+            "residual_signed": _dec_str(residual_qty),
+        })
+        try:
+            res = await self.var_placer.place_close_order(
+                side=side, qty=qty, asset=asset,
+                timeout_ms=self.config.var_order_timeout_ms,
+            )
+            self.events.emit({
+                "ts": _utc_now_iso(), "event": "residual_close_var_ack",
+                "ok": res.ok, "error": res.error,
+            })
+        except Exception as exc:
+            self.logger.warning("residual_close_var failed: %s", exc)
+
+    async def _close_lighter_residual(self, asset: str, residual_qty: Decimal) -> None:
+        """Single-venue Lighter reduce-only close for `residual_qty` signed."""
+        qty = quantize_qty(abs(residual_qty))
+        if qty <= 0:
+            return
+        # If long, SELL; if short, BUY
+        side = "SELL" if residual_qty > 0 else "BUY"
+        # Aggressive limit price with slippage buffer
+        bid, ask = await self.lighter.best_bid_ask()
+        if bid is None or ask is None:
+            return
+        slippage = Decimal(str(self.config.hedge_slippage_bps)) / Decimal("10000")
+        if side == "BUY":
+            limit_px = ask * (Decimal("1") + slippage)
+        else:
+            limit_px = bid * (Decimal("1") - slippage)
+        import time as _time
+        co_id = int(_time.time() * 1000)
+        async with self._lock:
+            while co_id in self._lighter_order_to_cycle:
+                co_id += 1
+        self.events.emit({
+            "ts": _utc_now_iso(), "event": "residual_close_lighter",
+            "asset": asset, "side": side, "qty": _dec_str(qty),
+            "residual_signed": _dec_str(residual_qty), "limit_px": _dec_str(limit_px),
+        })
+        try:
+            res = await self.lighter.place_order(
+                side=side, qty=qty, limit_px=limit_px,
+                client_order_id=co_id, reduce_only=True,
+            )
+            self.events.emit({
+                "ts": _utc_now_iso(), "event": "residual_close_lighter_ack",
+                "ok": res.ok, "error": res.error,
+            })
+        except Exception as exc:
+            self.logger.warning("residual_close_lighter failed: %s", exc)
 
     def get_positions(self) -> dict[str, tuple[Decimal, Decimal]]:
         """Read-only snapshot of per-venue position state.
@@ -948,6 +1069,52 @@ class AutoTrader:
         })
 
         self._update_stats_on_close(cycle, attribution)
+
+        # Post-cycle position verification: query both venues and compare
+        # with the tracker. Catches partial-fill drift, missed WS events, etc.
+        asyncio.create_task(self._verify_positions_after_cycle(cycle))
+
+    async def _verify_positions_after_cycle(self, cycle: TradeCycle) -> None:
+        try:
+            var_actual = await self.var_placer.get_position(cycle.asset)
+            lig_actual = await self.lighter.get_position(cycle.asset)
+        except Exception as exc:
+            self.logger.warning("verify_positions_after_cycle fetch failed: %s", exc)
+            return
+        var_track = self._var_pos_qty
+        lig_track = self._lighter_pos_qty
+        var_diff = (var_actual - var_track) if var_actual is not None else None
+        lig_diff = (lig_actual - lig_track) if lig_actual is not None else None
+        self.events.emit({
+            "ts": _utc_now_iso(), "event": "position_verify",
+            "cycle_id": cycle.cycle_id,
+            "var_tracker": _dec_str(var_track),
+            "var_actual": _dec_str(var_actual),
+            "var_diff": _dec_str(var_diff),
+            "lighter_tracker": _dec_str(lig_track),
+            "lighter_actual": _dec_str(lig_actual),
+            "lighter_diff": _dec_str(lig_diff),
+        })
+        # If either side drifted > quantum, sync tracker to exchange reality.
+        threshold = QTY_QUANTUM
+        synced = False
+        if var_actual is not None and var_diff is not None and abs(var_diff) > threshold:
+            self.logger.warning(
+                "Var position drift %s -> syncing tracker %s to actual %s",
+                var_diff, var_track, var_actual,
+            )
+            self._var_pos_qty = var_actual
+            synced = True
+        if lig_actual is not None and lig_diff is not None and abs(lig_diff) > threshold:
+            self.logger.warning(
+                "Lighter position drift %s -> syncing tracker %s to actual %s",
+                lig_diff, lig_track, lig_actual,
+            )
+            self._lighter_pos_qty = lig_actual
+            synced = True
+        if synced:
+            async with self._lock:
+                self._update_mode()
 
     def _compute_attribution(self, cycle: TradeCycle) -> dict[str, Any]:
         plan = cycle.plan or TradePlan(

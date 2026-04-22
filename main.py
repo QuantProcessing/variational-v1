@@ -52,6 +52,7 @@ FORWARDER_COMMAND_PORT = 8768
 VAR_QUOTE_URL = "https://omni.variational.io/api/quotes/indicative"
 VAR_NEW_MARKET_URL = "https://omni.variational.io/api/orders/new/market"
 VAR_QUOTE_ACCEPT_URL = "https://omni.variational.io/api/quotes/accept"
+VAR_POSITIONS_URL = "https://omni.variational.io/api/positions"
 # Variational perpetual futures on omni.variational.io are all hourly-funded,
 # USDC-settled. If Variational adds products outside that shape, make these
 # overrides per-asset.
@@ -330,6 +331,37 @@ class VariationalPlacerImpl:
             submit_url=VAR_QUOTE_ACCEPT_URL, is_reduce_only=True,
         )
 
+    async def get_position(self, asset: str) -> Decimal | None:
+        """Return signed position qty from Variational /api/positions for `asset`."""
+        import json as _json
+        res = await self.cmd.execute_fetch(
+            url=VAR_POSITIONS_URL, method="GET",
+            headers={"accept": "application/json"}, body=None,
+            timeout_ms=5000,
+        )
+        if not res.ok or (res.status is not None and res.status >= 400):
+            return None
+        try:
+            payload = _json.loads(res.body or "[]")
+        except Exception:
+            return None
+        if not isinstance(payload, list):
+            return None
+        for p in payload:
+            try:
+                info = p.get("position_info", {})
+                inst = info.get("instrument", {})
+                if str(inst.get("underlying", "")).upper() != asset.upper():
+                    continue
+                qty = info.get("qty")
+                if qty is None:
+                    continue
+                # Variational reports signed qty (+long, -short) in position_info.qty
+                return Decimal(str(qty))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return Decimal("0")  # no position found for this asset
+
 
 class LighterAdapterImpl:
     def __init__(self, runtime: "VariationalToLighterRuntime") -> None:
@@ -369,6 +401,33 @@ class LighterAdapterImpl:
             return LighterPlaceResult(ok=True, client_order_id=client_order_id, tx_hash=tx_hash)
         except Exception as exc:
             return LighterPlaceResult(ok=False, client_order_id=client_order_id, error=f"exception: {exc}")
+
+    async def get_position(self, symbol: str) -> Decimal | None:
+        """Return signed Lighter position for `symbol` via REST /api/v1/account."""
+        runtime = self.runtime
+        def _fetch() -> Decimal | None:
+            try:
+                r = requests.get(
+                    f"{runtime.lighter_base_url}/api/v1/account",
+                    params={"by": "index", "value": str(runtime.account_index)},
+                    headers={"accept": "application/json"},
+                    timeout=5,
+                )
+                r.raise_for_status()
+                data = r.json()
+            except Exception:
+                return None
+            for p in (data.get("accounts", [{}])[0].get("positions") or []):
+                try:
+                    if str(p.get("symbol", "")).upper() != symbol.upper():
+                        continue
+                    mag = Decimal(str(p.get("position") or "0"))
+                    sign = int(p.get("sign", 1))
+                    return mag if sign >= 0 else -mag
+                except (TypeError, ValueError):
+                    continue
+            return Decimal("0")
+        return await asyncio.to_thread(_fetch)
 
 
 class VariationalToLighterRuntime:
