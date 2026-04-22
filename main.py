@@ -1255,26 +1255,15 @@ class VariationalToLighterRuntime:
     async def _venue_now_total(self) -> tuple[Decimal | None, Decimal | None]:
         """Current equity-incl-positions per venue (cash balance + uPnL).
 
-        uPnL is computed locally from (mark - avg_entry) × signed_qty when
-        AutoTrader has position state; WS-pushed uPnL is used as fallback.
+        uPnL is taken directly from each venue's WS stream (Variational
+        /portfolio pool.upnl, Lighter user_stats portfolio_value-collateral).
+        Locally deriving uPnL from our tracked avg_entry is unreliable because
+        `_verify_positions_after_cycle` only syncs qty, not avg — after a few
+        drift-sync events the tracked avg drifts from the venue's real avg
+        and our Now would differ from the venue's own display.
         """
         var_bal, var_upnl = await self.read_variational_account_snapshot()
         lig_bal, lig_upnl = await self.read_lighter_account_snapshot()
-        if self.auto_trader is not None:
-            positions = self.auto_trader.get_positions()
-            var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
-            async with self.lighter_order_book_lock:
-                lb, la = self.lighter_best_bid, self.lighter_best_ask
-            var_qty, var_avg = positions.get("var", (Decimal("0"), Decimal("0")))
-            lig_qty, lig_avg = positions.get("lighter", (Decimal("0"), Decimal("0")))
-            if var_qty == 0:
-                var_upnl = Decimal("0")
-            elif var_avg != 0 and var_bid is not None and var_ask is not None:
-                var_upnl = var_qty * ((var_bid + var_ask) / Decimal("2") - var_avg)
-            if lig_qty == 0:
-                lig_upnl = Decimal("0")
-            elif lig_avg != 0 and lb is not None and la is not None:
-                lig_upnl = lig_qty * ((lb + la) / Decimal("2") - lig_avg)
         var_now = (var_bal + var_upnl) if var_bal is not None and var_upnl is not None else None
         lig_now = (lig_bal + lig_upnl) if lig_bal is not None and lig_upnl is not None else None
         return var_now, lig_now

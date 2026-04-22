@@ -945,17 +945,6 @@ class AutoTrader:
         except Exception as exc:
             self.logger.warning("residual_close_lighter failed: %s", exc)
 
-    def get_positions(self) -> dict[str, tuple[Decimal, Decimal]]:
-        """Read-only snapshot of per-venue position state.
-
-        Returns { "var": (qty_signed, avg_price), "lighter": (...) }.
-        qty is signed (+long, -short); avg_price is 0 if no position.
-        """
-        return {
-            "var": (self._var_pos_qty, self._var_pos_avg),
-            "lighter": (self._lighter_pos_qty, self._lighter_pos_avg),
-        }
-
     def get_recent_cycles(self, limit: int | None = None) -> list[TradeCycle]:
         """Snapshot of recent cycles (open + closed), newest-first.
 
