@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -65,7 +66,8 @@ class TradePlan:
     qty_target: Decimal
     expected_var_fill_px: Decimal | None
     expected_lighter_fill_px: Decimal | None
-    expected_gross_pct: float | None
+    # Expected cross-spread % at fire time. Both venues are zero-fee, so
+    # expected_net == expected_gross — we only carry one field.
     expected_net_pct: float | None
 
 
@@ -76,7 +78,6 @@ class LegState:
     requested_qty: Decimal = Decimal("0")
     filled_qty: Decimal = Decimal("0")
     avg_fill_px: Decimal | None = None
-    partial_fill_count: int = 0
     error: str | None = None
     terminal: bool = False
 
@@ -84,8 +85,13 @@ class LegState:
 @dataclass(slots=True)
 class VarLegState(LegState):
     api_latency_ms: int | None = None
-    trade_ids: list[str] = field(default_factory=list)
-    request_id: str | None = None
+    # rfq_id returned by /api/orders/new/market. This is the correlation key
+    # that Var /events WS echoes back as `source_rfq`. Set AFTER the HTTP
+    # response; fills that arrive before that are buffered and replayed.
+    rfq_id: str | None = None
+    # Variational's fill-level trade_id from /events WS. Populated on the
+    # first Var fill for this cycle; purely for display/diagnostics.
+    trade_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -107,7 +113,6 @@ class TradeCycle:
     var_leg: VarLegState = field(default_factory=VarLegState)
     lighter_leg: LighterLegState = field(default_factory=LighterLegState)
     status: str = "opening"
-    quote_drift_ms: int | None = None
     reason_codes: list[str] = field(default_factory=list)
 
 
@@ -124,12 +129,6 @@ class TraderStats:
     # Not reset on UTC day rollover.
     var_volume_usd: Decimal = Decimal("0")
     lighter_volume_usd: Decimal = Decimal("0")
-    # Cumulative realized P&L per venue, computed locally from the fill
-    # stream (sum of per-fill realized deltas from _update_venue_position).
-    # Don't trust venues' `balance`/`collateral` fields to reflect this —
-    # Variational's balance tracks realized, Lighter's collateral does not.
-    var_realized_pnl: Decimal = Decimal("0")
-    lighter_realized_pnl: Decimal = Decimal("0")
     frozen: bool = False
     frozen_reason: str | None = None
     _day_key: str = ""
@@ -236,12 +235,19 @@ class AutoTrader:
         self._lighter_order_to_cycle: dict[int, str] = {}
         self._lock = asyncio.Lock()
 
-        # Accumulated signed qty across all fired cycles (+qty for
-        # long_var_short_lighter, -qty for short_var_long_lighter). Incremented
-        # at fire time; reduced on close when fill_ratio < 1 or legs failed so
-        # that cancelled/partial cycles don't lock the accumulator permanently.
-        self._directional_net_qty: Decimal = Decimal("0")
-        self._cycle_signed_qty: dict[str, Decimal] = {}
+        # Var WS can push fill events before /api/orders/new/market HTTP returns
+        # the rfq_id we use to correlate. Buffer these unrouted fills keyed by
+        # rfq_id; _fire_var_leg drains the matching entry once HTTP returns.
+        # Each list entry carries (fill_px, fill_qty, trade_id, ts_monotonic)
+        # so stale entries (close-order fills, failed cycles) can be GC'd.
+        self._pending_var_fills: dict[str, list[tuple[Decimal, Decimal, str | None, float]]] = {}
+
+        # Recent cycles (open + closed) for dashboard/CSV rendering. Kept as a
+        # deque with bounded length so the dashboard can iterate newest-first
+        # without querying _open_cycles (opens show here while in-flight and
+        # remain after settlement).
+        self._recent_cycles: deque[TradeCycle] = deque(maxlen=500)
+
         # Hysteresis: once |net_qty| reaches position_limit we enter close mode
         # (signal fires paused; WS ticks drive active reduce-only closes when
         # close PnL >= 0). Exit close mode when |net_qty| drops below
@@ -303,22 +309,27 @@ class AutoTrader:
         if self._close_mode:
             return "close_mode"
         signed = self.config.qty if direction == "long_var_short_lighter" else -self.config.qty
-        current = self._directional_net_qty
-        projected = current + signed
+        projected = self._projected_net_qty() + signed
         if abs(projected) > self.config.position_limit:
             return "position_limit_exceeded"
         return None
 
-    def _update_mode(self) -> None:
-        """Recompute close-mode state from actual filled venue positions.
+    def _projected_net_qty(self) -> Decimal:
+        """Net signed exposure including in-flight cycles.
 
-        We do NOT include _directional_net_qty here: that tracker only
-        increments on cycle fires and is not decremented by close fills
-        (closes don't belong to cycles), so using it would lock us in
-        close mode forever once we've accumulated to the limit. Actual
-        filled positions are the ground truth for whether we still have
-        exposure to reduce.
+        = filled var position + unfilled remainder of open cycles' var legs,
+        signed by direction. No separate accumulator; derived on demand.
         """
+        net = self._var_pos_qty
+        for c in self._open_cycles.values():
+            remaining = c.var_leg.requested_qty - c.var_leg.filled_qty
+            if remaining <= 0:
+                continue
+            net += remaining if c.direction == "long_var_short_lighter" else -remaining
+        return net
+
+    def _update_mode(self) -> None:
+        """Recompute close-mode state from actual filled venue positions."""
         abs_net = max(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
         limit = self.config.position_limit
         resume_at = limit * self.config.reduce_only_resume_fraction
@@ -366,16 +377,12 @@ class AutoTrader:
             var_side = "sell"
             lighter_side = "BUY"
 
-        expected_gross_pct = float(ds.cross_spread_pct) if ds.cross_spread_pct is not None else None
-        # Both venues are zero-fee: Variational is RFQ (no taker/maker fee),
-        # Lighter basic account is 0-fee (accepts a 200ms delay). net == gross.
-        expected_net_pct = expected_gross_pct
+        expected_net_pct = float(ds.cross_spread_pct) if ds.cross_spread_pct is not None else None
 
         plan = TradePlan(
             qty_target=self.config.qty,
             expected_var_fill_px=expected_var_fill,
             expected_lighter_fill_px=expected_lighter_fill,
-            expected_gross_pct=expected_gross_pct,
             expected_net_pct=expected_net_pct,
         )
 
@@ -392,13 +399,11 @@ class AutoTrader:
         cycle.var_leg.requested_qty = open_qty
         cycle.lighter_leg.requested_qty = open_qty
 
-        signed_commitment = self.config.qty if direction == "long_var_short_lighter" else -self.config.qty
         async with self._lock:
             self._open_cycles[cycle_id] = cycle
+            self._recent_cycles.appendleft(cycle)
             self._last_fire_monotonic[direction] = now_mono
             self.stats.trades_today += 1
-            self._directional_net_qty += signed_commitment
-            self._cycle_signed_qty[cycle_id] = signed_commitment
             self._update_mode()
 
         self.events.emit({
@@ -408,7 +413,6 @@ class AutoTrader:
             "plan": {
                 "expected_var_fill_px": _dec_str(expected_var_fill),
                 "expected_lighter_fill_px": _dec_str(expected_lighter_fill),
-                "expected_gross_pct": expected_gross_pct,
                 "expected_net_pct": expected_net_pct,
             },
         })
@@ -459,8 +463,6 @@ class AutoTrader:
         asyncio.create_task(self._settle_cycle_when_done(cycle))
 
     async def _fire_var_leg(self, cycle: TradeCycle, side: str) -> None:
-        import time
-        t0 = time.monotonic()
         cycle.var_leg.placed_at = _utc_now_iso()
         self.events.emit({
             "ts": cycle.var_leg.placed_at, "event": "var_place_attempt",
@@ -475,8 +477,6 @@ class AutoTrader:
                 timeout_ms=self.config.var_order_timeout_ms,
             )
             cycle.var_leg.api_latency_ms = res.latency_ms
-            cycle.var_leg.request_id = res.request_id
-            cycle.quote_drift_ms = int((time.monotonic() - t0) * 1000)
             self.events.emit({
                 "ts": _utc_now_iso(), "event": "var_place_ack",
                 "cycle_id": cycle.cycle_id, "ok": res.ok,
@@ -489,8 +489,18 @@ class AutoTrader:
                 self._register_failure(f"var_http_{res.raw_status}" if res.raw_status else "var_error")
                 cycle.reason_codes.append(cycle.var_leg.error)
             else:
+                # res.trade_id is actually the rfq_id from /api/orders/new/market.
+                # Record it, then drain any fills that arrived before this HTTP
+                # returned (Var /events WS often beats the HTTP by several hundred ms).
                 if res.trade_id:
-                    cycle.var_leg.trade_ids.append(res.trade_id)
+                    cycle.var_leg.rfq_id = res.trade_id
+                    async with self._lock:
+                        buffered = self._pending_var_fills.pop(res.trade_id, None)
+                    if buffered:
+                        for fill_px, fill_qty, trade_id, _ts in buffered:
+                            if trade_id and not cycle.var_leg.trade_id:
+                                cycle.var_leg.trade_id = trade_id
+                            self._apply_var_fill(cycle, fill_px, fill_qty)
         except Exception as exc:
             cycle.var_leg.error = f"exception: {exc}"
             cycle.var_leg.terminal = True
@@ -586,29 +596,56 @@ class AutoTrader:
                             reason, self.stats.consecutive_failures, self.stats.failures_today)
 
     async def on_variational_fill(
-        self, trade_id: str, fill_px: Decimal, fill_qty: Decimal, side: str | None = None,
+        self,
+        rfq_id: str | None,
+        trade_id: str | None,
+        fill_px: Decimal,
+        fill_qty: Decimal,
+        side: str | None = None,
     ) -> None:
-        """Route a Variational fill (from monitor) to an open cycle by trade_id.
+        """Route a Variational fill from /events WS to its cycle via rfq_id.
 
-        Updates per-venue position accounting unconditionally (regardless of
-        whether the fill belongs to a tracked cycle or to a close order),
-        then routes to a cycle if the correlation key matches.
+        Per-venue position accounting runs unconditionally so close-order
+        fills (which don't belong to any cycle) still update the tracker.
+        Cycle routing is rfq_id-keyed; fills whose rfq_id hasn't been
+        assigned yet (HTTP still in flight) are buffered and replayed from
+        _fire_var_leg when the HTTP response lands.
         """
         if side is not None:
             signed = fill_qty if side.lower() == "buy" else -fill_qty
-            realized = self._update_venue_position("var", signed, fill_px)
+            self._update_venue_position("var", signed, fill_px)
             self.stats.var_volume_usd += fill_px * fill_qty
-            self.stats.var_realized_pnl += realized
             async with self._lock:
                 self._update_mode()
+
+        if not rfq_id:
+            return  # close order without correlation — position updated above
+
+        import time as _time
+        now_mono = _time.monotonic()
         async with self._lock:
             target: TradeCycle | None = None
             for cycle in self._open_cycles.values():
-                if trade_id in cycle.var_leg.trade_ids:
+                if cycle.var_leg.rfq_id == rfq_id:
                     target = cycle
                     break
-        if target is None:
-            return
+            if target is None:
+                self._pending_var_fills.setdefault(rfq_id, []).append(
+                    (fill_px, fill_qty, trade_id, now_mono)
+                )
+                # GC: drop buffer entries older than 60s. The HTTP-vs-WS race
+                # window is < 1s in practice; anything older is an orphaned
+                # fill (close order with no cycle, or a cycle whose HTTP
+                # errored before it could set rfq_id).
+                ttl = 60.0
+                stale = [k for k, v in self._pending_var_fills.items()
+                         if all((now_mono - entry[3]) > ttl for entry in v)]
+                for k in stale:
+                    del self._pending_var_fills[k]
+                return
+
+        if trade_id and not target.var_leg.trade_id:
+            target.var_leg.trade_id = trade_id
         self._apply_var_fill(target, fill_px, fill_qty)
 
     async def on_lighter_fill(
@@ -616,9 +653,8 @@ class AutoTrader:
     ) -> None:
         if side is not None:
             signed = fill_qty if side.upper() == "BUY" else -fill_qty
-            realized = self._update_venue_position("lighter", signed, fill_px)
+            self._update_venue_position("lighter", signed, fill_px)
             self.stats.lighter_volume_usd += fill_px * fill_qty
-            self.stats.lighter_realized_pnl += realized
             async with self._lock:
                 self._update_mode()
         async with self._lock:
@@ -628,60 +664,29 @@ class AutoTrader:
             return
         self._apply_lighter_fill(cycle, fill_px, fill_qty)
 
-    def _update_venue_position(self, venue: str, fill_qty_signed: Decimal, fill_px: Decimal) -> Decimal:
-        """Classic perpetual position accounting. Returns realized PnL delta.
-
-        Also decrements self._directional_net_qty whenever a fill SHRINKS
-        |venue_pos|. This keeps the commit-tracker in sync with actual
-        exposure after reduce-only closes (which are not cycle fires and
-        otherwise never touch _directional_net_qty), so that later
-        _gate_check projections reflect the real remaining budget.
-        Only applied on the var side to avoid double-counting both legs.
-        """
+    def _update_venue_position(self, venue: str, fill_qty_signed: Decimal, fill_px: Decimal) -> None:
+        """Classic perpetual position accounting (signed qty + cost basis avg)."""
         if venue == "var":
             old_qty, old_avg = self._var_pos_qty, self._var_pos_avg
         else:
             old_qty, old_avg = self._lighter_pos_qty, self._lighter_pos_avg
 
         new_qty = old_qty + fill_qty_signed
-        realized = Decimal("0")
-
         if old_qty == 0:
             new_avg = fill_px
         elif (old_qty > 0) == (fill_qty_signed > 0):
-            # same direction — weighted average cost
             new_avg = (abs(old_qty) * old_avg + abs(fill_qty_signed) * fill_px) / abs(new_qty)
+        elif new_qty == 0:
+            new_avg = Decimal("0")
+        elif (new_qty > 0) != (old_qty > 0):
+            new_avg = fill_px     # flipped — new position starts at fill_px
         else:
-            # opposite — realize P&L on the overlap
-            close_qty = min(abs(old_qty), abs(fill_qty_signed))
-            if old_qty > 0:
-                realized = close_qty * (fill_px - old_avg)
-            else:
-                realized = close_qty * (old_avg - fill_px)
-            if new_qty == 0:
-                new_avg = Decimal("0")
-            elif (new_qty > 0) != (old_qty > 0):
-                new_avg = fill_px      # flipped side — new position starts at fill_px
-            else:
-                new_avg = old_avg      # partial close — basis unchanged
+            new_avg = old_avg     # partial close — basis unchanged
 
         if venue == "var":
             self._var_pos_qty, self._var_pos_avg = new_qty, new_avg
-            # Keep _directional_net_qty in sync on position reductions
-            # (closes). Use var side as the authoritative sync source.
-            shrink = abs(old_qty) - abs(new_qty)
-            if shrink > 0:
-                if self._directional_net_qty > 0:
-                    self._directional_net_qty = max(
-                        Decimal("0"), self._directional_net_qty - shrink,
-                    )
-                elif self._directional_net_qty < 0:
-                    self._directional_net_qty = min(
-                        Decimal("0"), self._directional_net_qty + shrink,
-                    )
         else:
             self._lighter_pos_qty, self._lighter_pos_avg = new_qty, new_avg
-        return realized
 
     # ---------- WS-driven active close (close mode) ----------
 
@@ -702,8 +707,6 @@ class AutoTrader:
             return
         if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
             return
-        # Use actual filled venue positions, NOT _directional_net_qty (which is
-        # commit-based and doesn't reflect fills).
         # If one side is 0, paired close is impossible. Kick off a residual
         # handler that queries actual positions from both venues and fires a
         # single-venue reduce-only close on whichever side still has inventory.
@@ -948,54 +951,58 @@ class AutoTrader:
             "lighter": (self._lighter_pos_qty, self._lighter_pos_avg),
         }
 
-    def peek_lighter_info(
-        self, rfq_id: str
-    ) -> tuple[int | None, str | None, Decimal | None, str | None]:
-        """Read-only lookup for the dashboard's OrderLifecycle bridge.
+    def get_recent_cycles(self, limit: int | None = None) -> list[TradeCycle]:
+        """Snapshot of recent cycles (open + closed), newest-first.
 
-        Returns (client_order_id, tx_hash, avg_fill_px, filled_at) for an open
-        cycle whose var_leg was tagged with this rfq_id. All-None when no
-        match (cycle never existed, or already settled and popped).
+        Dashboard / CSV export read from this; they MUST treat the returned
+        objects as read-only — AutoTrader continues to mutate them as fills
+        stream in.
         """
-        for cycle in self._open_cycles.values():
-            if rfq_id in cycle.var_leg.trade_ids:
-                leg = cycle.lighter_leg
-                return (leg.client_order_id, leg.tx_hash, leg.avg_fill_px, leg.filled_at)
-        return (None, None, None, None)
+        snapshot = list(self._recent_cycles)
+        if limit is not None:
+            snapshot = snapshot[:limit]
+        return snapshot
+
+    async def reset_for_asset_switch(self) -> None:
+        """Clear all cycle/position state on asset-switch. Positions on the old
+        asset are assumed already closed (else asset-switch shouldn't fire)."""
+        async with self._lock:
+            self._open_cycles.clear()
+            self._recent_cycles.clear()
+            self._pending_var_fills.clear()
+            self._lighter_order_to_cycle.clear()
+            self._var_pos_qty = Decimal("0")
+            self._var_pos_avg = Decimal("0")
+            self._lighter_pos_qty = Decimal("0")
+            self._lighter_pos_avg = Decimal("0")
+            self._close_mode = False
+            self._close_in_progress = False
 
     def _apply_var_fill(self, cycle: TradeCycle, fill_px: Decimal, fill_qty: Decimal) -> None:
-        leg = cycle.var_leg
-        prior_filled = leg.filled_qty
-        leg.filled_qty += fill_qty
-        if leg.avg_fill_px is None:
-            leg.avg_fill_px = fill_px
-        else:
-            leg.avg_fill_px = ((leg.avg_fill_px * prior_filled) + (fill_px * fill_qty)) / leg.filled_qty
-        leg.partial_fill_count += 1
-        leg.filled_at = _utc_now_iso()
+        self._apply_fill(cycle.var_leg, fill_px, fill_qty)
         self.events.emit({
-            "ts": leg.filled_at, "event": "var_fill",
+            "ts": cycle.var_leg.filled_at, "event": "var_fill",
             "cycle_id": cycle.cycle_id, "fill_px": _dec_str(fill_px),
             "fill_qty": _dec_str(fill_qty),
         })
-        if leg.filled_qty >= leg.requested_qty:
-            leg.terminal = True
 
     def _apply_lighter_fill(self, cycle: TradeCycle, fill_px: Decimal, fill_qty: Decimal) -> None:
-        leg = cycle.lighter_leg
+        self._apply_fill(cycle.lighter_leg, fill_px, fill_qty)
+        self.events.emit({
+            "ts": cycle.lighter_leg.filled_at, "event": "lighter_fill",
+            "cycle_id": cycle.cycle_id, "fill_px": _dec_str(fill_px),
+            "fill_qty": _dec_str(fill_qty),
+        })
+
+    @staticmethod
+    def _apply_fill(leg: LegState, fill_px: Decimal, fill_qty: Decimal) -> None:
         prior_filled = leg.filled_qty
         leg.filled_qty += fill_qty
         if leg.avg_fill_px is None:
             leg.avg_fill_px = fill_px
         else:
             leg.avg_fill_px = ((leg.avg_fill_px * prior_filled) + (fill_px * fill_qty)) / leg.filled_qty
-        leg.partial_fill_count += 1
         leg.filled_at = _utc_now_iso()
-        self.events.emit({
-            "ts": leg.filled_at, "event": "lighter_fill",
-            "cycle_id": cycle.cycle_id, "fill_px": _dec_str(fill_px),
-            "fill_qty": _dec_str(fill_qty),
-        })
         if leg.filled_qty >= leg.requested_qty:
             leg.terminal = True
 
@@ -1033,31 +1040,10 @@ class AutoTrader:
                 cycle.status = "one_leg_failed"
 
         cycle.closed_at = _utc_now_iso()
-        # Reconcile directional_net_qty against actual fills. The cycle
-        # contributed `signed_commitment` at fire time on the assumption it
-        # would fully fill. If it partially filled or failed, refund the
-        # unfilled portion so the accumulator reflects real exposure, not
-        # pending commitments that never materialized.
-        qty_target = cycle.var_leg.requested_qty or self.config.qty
-        actual_min_ratio = Decimal("0")
-        if qty_target > 0:
-            var_ratio = (cycle.var_leg.filled_qty / qty_target) if cycle.var_leg.filled_qty else Decimal("0")
-            lig_ratio = (cycle.lighter_leg.filled_qty / qty_target) if cycle.lighter_leg.filled_qty else Decimal("0")
-            # Use min() because both legs together represent the "matched"
-            # exposure; unmatched single-leg fills are residual risk but for
-            # cross-venue balance we track the matched part.
-            actual_min_ratio = min(var_ratio, lig_ratio)
-            if actual_min_ratio > Decimal("1"):
-                actual_min_ratio = Decimal("1")
-
         async with self._lock:
             self._open_cycles.pop(cycle.cycle_id, None)
             if cycle.lighter_leg.client_order_id is not None:
                 self._lighter_order_to_cycle.pop(cycle.lighter_leg.client_order_id, None)
-            committed = self._cycle_signed_qty.pop(cycle.cycle_id, Decimal("0"))
-            unfilled_refund = committed * (Decimal("1") - actual_min_ratio)
-            if unfilled_refund != 0:
-                self._directional_net_qty -= unfilled_refund
             self._update_mode()
 
         attribution = self._compute_attribution(cycle)
@@ -1121,7 +1107,6 @@ class AutoTrader:
             qty_target=cycle.var_leg.requested_qty,
             expected_var_fill_px=None,
             expected_lighter_fill_px=None,
-            expected_gross_pct=None,
             expected_net_pct=None,
         )
         var_avg = cycle.var_leg.avg_fill_px
@@ -1130,7 +1115,6 @@ class AutoTrader:
         realized_net_pct: float | None = None
         var_slip_pct: float | None = None
         lig_slip_pct: float | None = None
-        fee_pct = 0.0  # Zero-fee venues; key kept for schema continuity.
 
         if cycle.direction == "long_var_short_lighter" and var_avg is not None and lig_avg is not None and var_avg != 0:
             realized_net_pct = float((lig_avg - var_avg) / var_avg) * 100.0
@@ -1164,9 +1148,7 @@ class AutoTrader:
             "components": {
                 "var_slippage_pct": var_slip_pct,
                 "lighter_slippage_pct": lig_slip_pct,
-                "fee_pct": fee_pct,
                 "fill_ratio": fill_ratio,
-                "quote_drift_ms": cycle.quote_drift_ms,
                 "reason_codes": list(cycle.reason_codes),
             },
         }
@@ -1214,7 +1196,6 @@ class AutoTrader:
                 "qty_target": _dec_str(plan.qty_target),
                 "expected_var_fill_px": _dec_str(plan.expected_var_fill_px),
                 "expected_lighter_fill_px": _dec_str(plan.expected_lighter_fill_px),
-                "expected_gross_pct": plan.expected_gross_pct,
                 "expected_net_pct": plan.expected_net_pct,
             },
             "var_leg": {
@@ -1224,7 +1205,8 @@ class AutoTrader:
                 "filled_qty": _dec_str(cycle.var_leg.filled_qty),
                 "avg_fill_px": _dec_str(cycle.var_leg.avg_fill_px),
                 "api_latency_ms": cycle.var_leg.api_latency_ms,
-                "partial_fill_count": cycle.var_leg.partial_fill_count,
+                "rfq_id": cycle.var_leg.rfq_id,
+                "trade_id": cycle.var_leg.trade_id,
                 "error": cycle.var_leg.error,
             },
             "lighter_leg": {

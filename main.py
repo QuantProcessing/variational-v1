@@ -7,12 +7,9 @@ import logging
 import os
 import signal
 import time
-from collections import deque
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from statistics import median
 from typing import Any
 
 import requests
@@ -148,45 +145,6 @@ def normalize_variational_status(status: str) -> str:
     if lowered == "confirmed":
         return "filled"
     return lowered
-
-
-@dataclass(slots=True)
-class OrderLifecycle:
-    trade_key: str
-    trade_id: str
-    side: str
-    qty: Decimal
-    asset: str
-    auto_hedge_enabled: bool
-    last_variational_status: str
-
-    var_fill_price: Decimal | None = None
-    var_fill_ts_iso: str | None = None
-
-    lighter_side: str | None = None
-    lighter_client_order_id: int | None = None
-    lighter_fill_price: Decimal | None = None
-    lighter_fill_ts_iso: str | None = None
-    lighter_tx_hash: str | None = None
-    hedge_error: str | None = None
-
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "trade_key": self.trade_key,
-            "trade_id": self.trade_id,
-            "side": self.side,
-            "qty": decimal_to_str(self.qty),
-            "asset": self.asset,
-            "variational_filled_price": decimal_to_str(self.var_fill_price),
-            "variational_filled_at": self.var_fill_ts_iso,
-            "lighter_order_side": self.lighter_side,
-            "lighter_client_order_id": self.lighter_client_order_id,
-            "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
-            "lighter_filled_at": self.lighter_fill_ts_iso,
-            "auto_hedge_enabled": self.auto_hedge_enabled,
-            "hedge_error": self.hedge_error,
-            "last_variational_status": self.last_variational_status,
-        }
 
 
 class VariationalRuntime:
@@ -459,22 +417,16 @@ class VariationalToLighterRuntime:
             quiet=True,
         )
 
-        self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self.signal_events_file = output_dir / "signal_events.jsonl" if output_dir else LOG_DIR / "signal_events.jsonl"
         self.signal_journal = EventJournal(self.signal_events_file)
         self.events_journal = EventJournal(LOG_DIR / "order_events.jsonl")
         self.cycles_journal = EventJournal(LOG_DIR / "cycle_pnl.jsonl")
-        self.auto_trader = None    # constructed in run() once market is known (Task 3.6)
+        self.auto_trader: AutoTrader | None = None
         self.cmd_client: VariationalCmdClient | None = None
-        self._order_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
         self._trade_records_snapshot_sig: str | None = None
 
-        self.records: dict[str, OrderLifecycle] = {}
-        self.record_order: deque[str] = deque(maxlen=500)
-        self.lighter_client_order_to_trade_key: dict[int, str] = {}
-        self._record_lock = asyncio.Lock()
         self.signal_engine = SignalEngine(strict=args.signal_strict)
         self._asset_switch_lock = asyncio.Lock()
         self._asset_switch_candidate: str | None = None
@@ -610,11 +562,9 @@ class VariationalToLighterRuntime:
         raise RuntimeError("Timed out deriving ticker from Variational quote/trade messages")
 
     async def _reset_state_for_asset_switch(self) -> None:
-        async with self._record_lock:
-            self.records.clear()
-            self.record_order.clear()
-            self.lighter_client_order_to_trade_key.clear()
-        self.signal_engine = SignalEngine(strict=self.args.signal_strict)
+        if self.auto_trader is not None:
+            await self.auto_trader.reset_for_asset_switch()
+        self.signal_engine.reset()
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -745,50 +695,22 @@ class VariationalToLighterRuntime:
         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
     async def handle_lighter_fill_update(self, order: dict[str, Any]) -> None:
-        if order.get("status") != "filled":
+        if order.get("status") != "filled" or self.auto_trader is None:
             return
-
-        client_order_id_raw = order.get("client_order_id")
         try:
-            client_order_id = int(client_order_id_raw)
-        except Exception:
+            client_order_id = int(order.get("client_order_id"))
+        except (TypeError, ValueError):
             return
-
-        fill_price: Decimal | None = None
         filled_quote = to_decimal(order.get("filled_quote_amount"))
         filled_base = to_decimal(order.get("filled_base_amount"))
-        if filled_quote is not None and filled_base is not None and filled_base != 0:
-            fill_price = filled_quote / filled_base
-
-        # Route to AutoTrader FIRST; this path uses _lighter_order_to_cycle
-        # which is populated by AutoTrader itself, independent of the legacy
-        # OrderLifecycle bookkeeping below. Must run before any early return
-        # that is gated on the legacy lookup (which fails under the new
-        # AutoTrader-driven flow since place_lighter_order is gone).
-        if self.auto_trader is not None and fill_price is not None and filled_base is not None:
-            # Lighter order: is_ask True -> sell, False -> buy.
-            side = "SELL" if order.get("is_ask") else "BUY"
-            await self.auto_trader.on_lighter_fill(
-                client_order_id, fill_price, filled_base, side=side,
-            )
-
-        now_iso = utc_now()
-
-        async with self._record_lock:
-            trade_key = self.lighter_client_order_to_trade_key.get(client_order_id)
-            if not trade_key:
-                return
-            record = self.records.get(trade_key)
-            if record is None:
-                return
-            if record.lighter_fill_ts_iso is not None:
-                return
-
-            record.lighter_fill_ts_iso = now_iso
-            record.lighter_fill_price = fill_price
-            payload = record.to_payload()
-
-        await self.append_order_log("lighter_fill", payload)
+        if filled_quote is None or filled_base is None or filled_base == 0:
+            return
+        fill_price = filled_quote / filled_base
+        # Lighter order: is_ask True -> sell, False -> buy.
+        side = "SELL" if order.get("is_ask") else "BUY"
+        await self.auto_trader.on_lighter_fill(
+            client_order_id, fill_price, filled_base, side=side,
+        )
 
     def build_lighter_ws_url(self) -> str:
         if env_flag("LIGHTER_WS_SERVER_PINGS"):
@@ -967,32 +889,6 @@ class VariationalToLighterRuntime:
                 return None, None, None
             return to_decimal(quote.get("bid")), to_decimal(quote.get("ask")), str(quote.get("asset", ""))
 
-    @staticmethod
-    def trade_key(event: dict[str, Any]) -> str:
-        trade_id = str(event.get("trade_id", "")).strip()
-        if trade_id:
-            return f"id:{trade_id}"
-        event_seq = str(event.get("event_seq", "")).strip()
-        return f"seq:{event_seq}"
-
-    async def append_order_log(self, event_type: str, payload: dict[str, Any]) -> None:
-        if self.orders_file is None:
-            return
-        row = {
-            "event": event_type,
-            "logged_at": utc_now(),
-            **payload,
-        }
-        line = json.dumps(row, ensure_ascii=True) + "\n"
-        async with self._order_write_lock:
-            await asyncio.to_thread(self.orders_file.parent.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(self._append_line, self.orders_file, line)
-
-    @staticmethod
-    def _append_line(path: Path, line: str) -> None:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
         if side not in {"buy", "sell"}:
@@ -1010,94 +906,21 @@ class VariationalToLighterRuntime:
     async def process_variational_trade_event(self, event: dict[str, Any]) -> None:
         if not self.should_track_variational_event(event):
             return
-
-        key = self.trade_key(event)
-        side = str(event.get("side", "")).strip().lower()
-        qty = to_decimal(event.get("qty"))
-        if qty is None:
+        if self.auto_trader is None:
             return
-
         status = normalize_variational_status(str(event.get("status", "")))
-        asset = str(event.get("asset", "")).strip().upper() or self.variational_ticker
-        trade_id = str(event.get("trade_id", "")).strip()
-
-        now_iso = utc_now()
-        fill_iso = str(event.get("timestamp") or now_iso)
-
-        created = False
-        created_record: OrderLifecycle | None = None
-
-        async with self._record_lock:
-            record = self.records.get(key)
-            if record is None:
-                record = OrderLifecycle(
-                    trade_key=key,
-                    trade_id=trade_id,
-                    side=side,
-                    qty=qty,
-                    asset=asset if asset else "UNKNOWN",
-                    auto_hedge_enabled=True,
-                    last_variational_status=status,
-                )
-                self.records[key] = record
-                self.record_order.append(key)
-                created = True
-                created_record = record
-            else:
-                previous_status = record.last_variational_status
-                record.last_variational_status = status
-
-            if created:
-                previous_status = ""
-
-            should_set_fill = False
-            if status == "filled":
-                if record.var_fill_ts_iso is None:
-                    should_set_fill = True
-                elif previous_status != "filled":
-                    should_set_fill = True
-
-            if should_set_fill:
-                record.var_fill_ts_iso = fill_iso
-                record.var_fill_price = to_decimal(event.get("price"))
-                filled_payload = record.to_payload()
-            else:
-                filled_payload = None
-
-        if filled_payload is not None:
-            await self.append_order_log("variational_fill", filled_payload)
-
-        if self.auto_trader is not None and filled_payload is not None:
-            fill_px = to_decimal(event.get("price"))
-            fill_qty_new = to_decimal(event.get("qty"))
-            # AutoTrader stores rfq_id (returned by /api/orders/new/market) on
-            # var_leg.trade_ids; match by rfq_id, not by the fill-level trade_id.
-            # listener normalizes rfq_id to str-or-None already.
-            rfq_id = event.get("rfq_id")
-            correlation_key = rfq_id or str(event.get("trade_id", "")).strip() or None
-            if fill_px is not None and fill_qty_new is not None and correlation_key:
-                var_side = str(event.get("side", "")).strip().lower() or None
-                await self.auto_trader.on_variational_fill(
-                    correlation_key, fill_px, fill_qty_new, side=var_side,
-                )
-
-            # Bridge AutoTrader's cycle state into the legacy OrderLifecycle so the
-            # dashboard's "recent orders" table and trade_records.csv can show
-            # the Lighter leg. Without this link, handle_lighter_fill_update has
-            # no trade_key to update because place_lighter_order (which used to
-            # populate lighter_client_order_to_trade_key) was removed.
-            if rfq_id and created_record is not None:
-                co_id, tx_hash, lighter_avg_px, lighter_filled_at = self.auto_trader.peek_lighter_info(rfq_id)
-                if co_id is not None:
-                    async with self._record_lock:
-                        created_record.lighter_side = "SELL" if side == "buy" else "BUY"
-                        created_record.lighter_client_order_id = co_id
-                        created_record.lighter_tx_hash = tx_hash
-                        self.lighter_client_order_to_trade_key[co_id] = key
-                        if lighter_avg_px is not None:
-                            created_record.lighter_fill_price = lighter_avg_px
-                        if lighter_filled_at is not None:
-                            created_record.lighter_fill_ts_iso = lighter_filled_at
+        if status != "filled":
+            return
+        fill_px = to_decimal(event.get("price"))
+        fill_qty = to_decimal(event.get("qty"))
+        if fill_px is None or fill_qty is None:
+            return
+        rfq_id = event.get("rfq_id")
+        trade_id = str(event.get("trade_id", "")).strip() or None
+        side = str(event.get("side", "")).strip().lower() or None
+        await self.auto_trader.on_variational_fill(
+            rfq_id, trade_id, fill_px, fill_qty, side=side,
+        )
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
@@ -1132,16 +955,6 @@ class VariationalToLighterRuntime:
             return "-"
         return format(value, "f")
 
-    @staticmethod
-    def _direction_labels(side: str) -> tuple[str, str]:
-        side_n = side.strip().lower()
-        if side_n == "buy":
-            return "做多 Var / 做空 Lighter", "Long Var / Short Lighter"
-        if side_n == "sell":
-            return "做空 Var / 做多 Lighter", "Short Var / Long Lighter"
-        side_u = side_n.upper() if side_n else "-"
-        return side_u, side_u
-
     def _fmt_pct(self, value: Decimal | None) -> str:
         if value is None:
             return "-"
@@ -1169,25 +982,28 @@ class VariationalToLighterRuntime:
         return f"[{color}]{self._fmt_pct(current)}[/{color}]"
 
     @staticmethod
-    def _fill_diff_by_direction(
-        side: str,
+    def _fill_diff_by_cycle_direction(
+        direction: str,
         var_fill_price: Decimal | None,
         lighter_fill_price: Decimal | None,
     ) -> tuple[Decimal | None, Decimal | None]:
-        side_n = side.strip().lower()
-        if side_n == "buy":
+        if direction == "long_var_short_lighter":
             # Long Var / Short Lighter: lighter_fill - var_fill
             diff = spread_value(var_fill_price, lighter_fill_price)
             pct = spread_percent(diff, var_fill_price)
             return diff, pct
-        if side_n == "sell":
-            # Short Var / Long Lighter: var_fill - lighter_fill
-            diff = spread_value(lighter_fill_price, var_fill_price)
-            pct = spread_percent(diff, lighter_fill_price)
-            return diff, pct
+        # short_var_long_lighter: var_fill - lighter_fill
         diff = spread_value(lighter_fill_price, var_fill_price)
-        pct = spread_percent(diff, var_fill_price)
+        pct = spread_percent(diff, lighter_fill_price)
         return diff, pct
+
+    @staticmethod
+    def _cycle_direction_labels(direction: str) -> tuple[str, str]:
+        if direction == "long_var_short_lighter":
+            return "做多 Var / 做空 Lighter", "Long Var / Short Lighter"
+        if direction == "short_var_long_lighter":
+            return "做空 Var / 做多 Lighter", "Short Var / Long Lighter"
+        return direction, direction
 
     @staticmethod
     def _decimal_as_float(value: Decimal | None) -> float | None:
@@ -1259,9 +1075,10 @@ class VariationalToLighterRuntime:
         short_pct_median_30m = state.short_direction.median_30m_pct
         short_pct_median_1h = state.short_direction.median_1h_pct
 
-        async with self._record_lock:
-            recent_keys = list(self.record_order)[-DASHBOARD_ORDERS:]
-            rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
+        rows = (
+            self.auto_trader.get_recent_cycles(DASHBOARD_ORDERS)
+            if self.auto_trader is not None else []
+        )
 
         is_zh = self.args.lang == "zh"
         header_title = "Variational <-> Lighter"
@@ -1380,22 +1197,24 @@ class VariationalToLighterRuntime:
                 "-",
             )
         else:
-            for row in rows:
-                payload = row.to_payload()
-                trade_display = row.trade_id[:10] if row.trade_id else row.trade_key[:10]
-                fill_diff, fill_diff_pct = self._fill_diff_by_direction(
-                    row.side,
-                    row.var_fill_price,
-                    row.lighter_fill_price,
+            for cycle in rows:
+                trade_display = (
+                    cycle.var_leg.trade_id[:10] if cycle.var_leg.trade_id
+                    else cycle.cycle_id[-10:]
                 )
-                side_zh, side_en = self._direction_labels(row.side)
+                var_px = cycle.var_leg.avg_fill_px
+                lig_px = cycle.lighter_leg.avg_fill_px
+                fill_diff, fill_diff_pct = self._fill_diff_by_cycle_direction(
+                    cycle.direction, var_px, lig_px,
+                )
+                side_zh, side_en = self._cycle_direction_labels(cycle.direction)
                 side_display = side_zh if is_zh else side_en
                 orders_table.add_row(
                     trade_display,
                     side_display,
-                    self._fmt_price(row.qty),
-                    payload["variational_filled_price"] or "-",
-                    payload["lighter_filled_price"] or "-",
+                    self._fmt_price(cycle.var_leg.requested_qty),
+                    self._fmt_price(var_px),
+                    self._fmt_price(lig_px),
                     self._fmt_price(fill_diff),
                     self._fmt_pct(fill_diff_pct),
                 )
@@ -1433,16 +1252,14 @@ class VariationalToLighterRuntime:
             return Group(header, quote_table, spread_table, orders_table, stats_panel)
         return Group(header, quote_table, spread_table, orders_table)
 
-    async def _render_account_panel(self, is_zh: bool):
-        var_bal, var_upnl_ws = await self.read_variational_account_snapshot()
-        lig_bal, lig_upnl_ws = await self.read_lighter_account_snapshot()
+    async def _venue_now_total(self) -> tuple[Decimal | None, Decimal | None]:
+        """Current equity-incl-positions per venue (cash balance + uPnL).
 
-        # Local uPnL estimate: qty_signed × (current_mark - avg_entry).
-        # Preferred over WS upnl because WS only pushes on account
-        # changes — if market moves without a trade, WS upnl goes stale.
-        # WS upnl is used as fallback when position accounting isn't ready.
-        var_upnl: Decimal | None = var_upnl_ws
-        lig_upnl: Decimal | None = lig_upnl_ws
+        uPnL is computed locally from (mark - avg_entry) × signed_qty when
+        AutoTrader has position state; WS-pushed uPnL is used as fallback.
+        """
+        var_bal, var_upnl = await self.read_variational_account_snapshot()
+        lig_bal, lig_upnl = await self.read_lighter_account_snapshot()
         if self.auto_trader is not None:
             positions = self.auto_trader.get_positions()
             var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
@@ -1450,167 +1267,153 @@ class VariationalToLighterRuntime:
                 lb, la = self.lighter_best_bid, self.lighter_best_ask
             var_qty, var_avg = positions.get("var", (Decimal("0"), Decimal("0")))
             lig_qty, lig_avg = positions.get("lighter", (Decimal("0"), Decimal("0")))
-            if var_qty != 0 and var_avg != 0 and var_bid is not None and var_ask is not None:
-                var_mark = (var_bid + var_ask) / Decimal("2")
-                var_upnl = var_qty * (var_mark - var_avg)
-            elif var_qty == 0:
+            if var_qty == 0:
                 var_upnl = Decimal("0")
-            if lig_qty != 0 and lig_avg != 0 and lb is not None and la is not None:
-                lig_mark = (lb + la) / Decimal("2")
-                lig_upnl = lig_qty * (lig_mark - lig_avg)
-            elif lig_qty == 0:
+            elif var_avg != 0 and var_bid is not None and var_ask is not None:
+                var_upnl = var_qty * ((var_bid + var_ask) / Decimal("2") - var_avg)
+            if lig_qty == 0:
                 lig_upnl = Decimal("0")
+            elif lig_avg != 0 and lb is not None and la is not None:
+                lig_upnl = lig_qty * ((lb + la) / Decimal("2") - lig_avg)
+        var_now = (var_bal + var_upnl) if var_bal is not None and var_upnl is not None else None
+        lig_now = (lig_bal + lig_upnl) if lig_bal is not None and lig_upnl is not None else None
+        return var_now, lig_now
 
-        def total(bal: Decimal | None, upnl: Decimal | None) -> Decimal | None:
-            if bal is None or upnl is None:
-                return None
-            return bal + upnl
+    async def _render_account_panel(self, is_zh: bool):
+        var_now, lig_now = await self._venue_now_total()
+        var_start = self.startup_var_total
+        lig_start = self.startup_lighter_total
 
-        def fmt_money(v: Decimal | None) -> str:
-            if v is None:
-                return "-"
-            return f"{v:.4f}"
-
-        def fmt_delta(v: Decimal | None) -> str:
-            if v is None:
-                return "-"
-            sign = "+" if v >= 0 else ""
-            return f"{sign}{v:.4f}"
-
-        var_total = total(var_bal, var_upnl)
-        lig_total = total(lig_bal, lig_upnl)
-        var_delta = (var_total - self.startup_var_total) if var_total is not None and self.startup_var_total is not None else None
-        lig_delta = (lig_total - self.startup_lighter_total) if lig_total is not None and self.startup_lighter_total is not None else None
-        grand_total = (var_total + lig_total) if var_total is not None and lig_total is not None else None
-        startup_grand = (
-            (self.startup_var_total + self.startup_lighter_total)
-            if self.startup_var_total is not None and self.startup_lighter_total is not None
-            else None
-        )
-        grand_delta = (
-            (grand_total - startup_grand)
-            if grand_total is not None and startup_grand is not None
-            else None
-        )
-
-        # Nothing to show yet
-        if var_total is None and lig_total is None and grand_total is None:
+        if var_now is None and lig_now is None and var_start is None and lig_start is None:
             return None
 
-        # Cumulative per-venue traded notional + locally-tracked realized P&L
         stats = self.auto_trader.snapshot() if self.auto_trader is not None else None
         var_vol = stats.var_volume_usd if stats is not None else None
         lig_vol = stats.lighter_volume_usd if stats is not None else None
-        var_realized = stats.var_realized_pnl if stats is not None else None
-        lig_realized = stats.lighter_realized_pnl if stats is not None else None
-        grand_vol = (
-            (var_vol + lig_vol)
-            if var_vol is not None and lig_vol is not None
-            else None
-        )
-        grand_realized = (
-            (var_realized + lig_realized)
-            if var_realized is not None and lig_realized is not None
-            else None
-        )
+
+        def _add(a: Decimal | None, b: Decimal | None) -> Decimal | None:
+            return (a + b) if a is not None and b is not None else None
+
+        def _sub(a: Decimal | None, b: Decimal | None) -> Decimal | None:
+            return (a - b) if a is not None and b is not None else None
+
+        grand_start = _add(var_start, lig_start)
+        grand_now = _add(var_now, lig_now)
+        grand_vol = _add(var_vol, lig_vol)
+        var_profit = _sub(var_now, var_start)
+        lig_profit = _sub(lig_now, lig_start)
+        grand_profit = _sub(grand_now, grand_start)
+
+        def fmt_money(v: Decimal | None) -> str:
+            return "-" if v is None else f"{v:.4f}"
+
+        def fmt_profit(v: Decimal | None) -> str:
+            if v is None:
+                return "-"
+            return f"{'+' if v >= 0 else ''}{v:.4f}"
 
         if is_zh:
             title = f"账户(启动 {self.startup_ts_iso or '-'})"
-            col_venue = "平台"; col_bal = "余额"; col_upnl = "浮盈"
-            col_realized = "已实现"; col_total = "总值"; col_delta = "Δ vs 启动"
-            col_vol = "累计交易量"
+            col_venue, col_start, col_now = "平台", "启动余额", "当前余额"
+            col_profit, col_vol = "盈亏", "累计交易量"
             row_grand = "合计"
         else:
             title = f"Account (anchored at {self.startup_ts_iso or '-'})"
-            col_venue = "Venue"; col_bal = "Balance"; col_upnl = "uPnL"
-            col_realized = "Realized"; col_total = "Total"; col_delta = "Δ vs start"
-            col_vol = "Cum. Volume"
+            col_venue, col_start, col_now = "Venue", "Start", "Now"
+            col_profit, col_vol = "Profit", "Volume"
             row_grand = "Grand Total"
 
         tbl = Table(title=title, show_header=True, expand=True)
         tbl.add_column(col_venue, style="bold")
-        tbl.add_column(col_bal, justify="right")
-        tbl.add_column(col_upnl, justify="right")
-        tbl.add_column(col_realized, justify="right")
-        tbl.add_column(col_total, justify="right")
-        tbl.add_column(col_delta, justify="right")
+        tbl.add_column(col_start, justify="right")
+        tbl.add_column(col_now, justify="right")
+        tbl.add_column(col_profit, justify="right")
         tbl.add_column(col_vol, justify="right")
-        tbl.add_row("Variational", fmt_money(var_bal), fmt_money(var_upnl),
-                    fmt_delta(var_realized),
-                    fmt_money(var_total), fmt_delta(var_delta), fmt_money(var_vol))
-        tbl.add_row("Lighter", fmt_money(lig_bal), fmt_money(lig_upnl),
-                    fmt_delta(lig_realized),
-                    fmt_money(lig_total), fmt_delta(lig_delta), fmt_money(lig_vol))
-        tbl.add_row(row_grand, "", "", fmt_delta(grand_realized),
-                    fmt_money(grand_total), fmt_delta(grand_delta), fmt_money(grand_vol))
+        tbl.add_row("Variational", fmt_money(var_start), fmt_money(var_now),
+                    fmt_profit(var_profit), fmt_money(var_vol))
+        tbl.add_row("Lighter", fmt_money(lig_start), fmt_money(lig_now),
+                    fmt_profit(lig_profit), fmt_money(lig_vol))
+        tbl.add_row(row_grand, fmt_money(grand_start), fmt_money(grand_now),
+                    fmt_profit(grand_profit), fmt_money(grand_vol))
 
-        border = "green" if (grand_delta is not None and grand_delta >= 0) else ("red" if grand_delta is not None else "cyan")
+        border = (
+            "green" if grand_profit is not None and grand_profit >= 0
+            else "red" if grand_profit is not None
+            else "cyan"
+        )
         return Panel(tbl, border_style=border)
 
     async def export_trade_records_csv(self) -> None:
-        if self.trade_records_csv_file is None:
+        if self.trade_records_csv_file is None or self.auto_trader is None:
             return
 
-        async with self._record_lock:
-            keys = list(self.record_order)
-            rows: list[dict[str, Any]] = []
-            for key in keys:
-                record = self.records.get(key)
-                if record is None:
-                    continue
-                payload = record.to_payload()
-                fill_diff, fill_diff_pct = self._fill_diff_by_direction(
-                    record.side,
-                    record.var_fill_price,
-                    record.lighter_fill_price,
-                )
-                side_zh, side_en = self._direction_labels(record.side)
-                rows.append(
-                    {
-                        "trade_key": record.trade_key,
-                        "trade_id": record.trade_id,
-                        "asset": record.asset,
-                        "side_raw": record.side,
-                        "direction_zh": side_zh,
-                        "direction_en": side_en,
-                        "qty": decimal_to_str(record.qty),
-                        "variational_filled_price": payload["variational_filled_price"],
-                        "variational_filled_at": payload["variational_filled_at"],
-                        "lighter_order_side": payload["lighter_order_side"],
-                        "lighter_client_order_id": payload["lighter_client_order_id"],
-                        "lighter_filled_price": payload["lighter_filled_price"],
-                        "lighter_filled_at": payload["lighter_filled_at"],
-                        "fill_diff_var_minus_lighter": decimal_to_str(fill_diff),
-                        "fill_diff_pct_vs_var": decimal_to_str(fill_diff_pct),
-                        "auto_hedge_enabled": payload["auto_hedge_enabled"],
-                        "hedge_error": payload["hedge_error"],
-                        "last_variational_status": payload["last_variational_status"],
-                    }
-                )
+        cycles = self.auto_trader.get_recent_cycles()
+        rows: list[dict[str, Any]] = []
+        for cycle in cycles:
+            var_px = cycle.var_leg.avg_fill_px
+            lig_px = cycle.lighter_leg.avg_fill_px
+            fill_diff, fill_diff_pct = self._fill_diff_by_cycle_direction(
+                cycle.direction, var_px, lig_px,
+            )
+            side_zh, side_en = self._cycle_direction_labels(cycle.direction)
+            rows.append(
+                {
+                    "cycle_id": cycle.cycle_id,
+                    "opened_at": cycle.opened_at,
+                    "closed_at": cycle.closed_at,
+                    "asset": cycle.asset,
+                    "direction": cycle.direction,
+                    "direction_zh": side_zh,
+                    "direction_en": side_en,
+                    "status": cycle.status,
+                    "qty_target": decimal_to_str(cycle.var_leg.requested_qty),
+                    "var_rfq_id": cycle.var_leg.rfq_id,
+                    "var_trade_id": cycle.var_leg.trade_id,
+                    "var_filled_qty": decimal_to_str(cycle.var_leg.filled_qty),
+                    "var_fill_px": decimal_to_str(var_px),
+                    "var_filled_at": cycle.var_leg.filled_at,
+                    "var_error": cycle.var_leg.error,
+                    "lighter_client_order_id": cycle.lighter_leg.client_order_id,
+                    "lighter_filled_qty": decimal_to_str(cycle.lighter_leg.filled_qty),
+                    "lighter_fill_px": decimal_to_str(lig_px),
+                    "lighter_filled_at": cycle.lighter_leg.filled_at,
+                    "lighter_tx_hash": cycle.lighter_leg.tx_hash,
+                    "lighter_error": cycle.lighter_leg.error,
+                    "fill_diff": decimal_to_str(fill_diff),
+                    "fill_diff_pct": decimal_to_str(fill_diff_pct),
+                    "reason_codes": ",".join(cycle.reason_codes) if cycle.reason_codes else "",
+                }
+            )
 
         snapshot_sig = json.dumps(rows, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         if snapshot_sig == self._trade_records_snapshot_sig:
             return
 
         fieldnames = [
-            "trade_key",
-            "trade_id",
+            "cycle_id",
+            "opened_at",
+            "closed_at",
             "asset",
-            "side_raw",
+            "direction",
             "direction_zh",
             "direction_en",
-            "qty",
-            "variational_filled_price",
-            "variational_filled_at",
-            "lighter_order_side",
+            "status",
+            "qty_target",
+            "var_rfq_id",
+            "var_trade_id",
+            "var_filled_qty",
+            "var_fill_px",
+            "var_filled_at",
+            "var_error",
             "lighter_client_order_id",
-            "lighter_filled_price",
+            "lighter_filled_qty",
+            "lighter_fill_px",
             "lighter_filled_at",
-            "fill_diff_var_minus_lighter",
-            "fill_diff_pct_vs_var",
-            "auto_hedge_enabled",
-            "hedge_error",
-            "last_variational_status",
+            "lighter_tx_hash",
+            "lighter_error",
+            "fill_diff",
+            "fill_diff_pct",
+            "reason_codes",
         ]
         async with self._trade_csv_write_lock:
             if snapshot_sig == self._trade_records_snapshot_sig:

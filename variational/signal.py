@@ -92,6 +92,15 @@ class SignalEngine:
     def get_state(self) -> SignalState | None:
         return self._state
 
+    def reset(self) -> None:
+        """Clear spread history and edge state. Called on asset switch so the
+        new asset's cross-spread distribution isn't contaminated by the old
+        asset's history. Subscribers survive."""
+        self._history.clear()
+        self._state = None
+        self._prev_long_green = False
+        self._prev_short_green = False
+
     def record(
         self,
         *,
