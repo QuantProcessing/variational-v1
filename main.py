@@ -1444,8 +1444,15 @@ class VariationalToLighterRuntime:
         ) as live:
             while not self.stop_flag:
                 await asyncio.sleep(refresh_interval)
-                live.update(await self.render_dashboard())
-                await self.export_trade_records_csv()
+                # Swallow per-tick exceptions to keep the dashboard alive —
+                # a stale/None quote from a venue should not tear down the
+                # whole loop (and with it, signal detection and cycle dispatch,
+                # since detect_edges runs inside render_dashboard).
+                try:
+                    live.update(await self.render_dashboard())
+                    await self.export_trade_records_csv()
+                except Exception:
+                    self.logger.exception("dashboard_loop tick failed; continuing")
 
     async def run(self) -> None:
         self.logger.info(
@@ -1559,9 +1566,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--throttle-seconds", type=float, default=3.0)
     parser.add_argument("--max-trades-per-day", type=int, default=200)
     parser.add_argument("--position-limit", type=str, default="0",
-                        help="Net directional position ceiling (signed qty). At |net|>=limit "
-                             "we enter reduce-only mode until |net| drops to 50%% of limit. "
-                             "0 means auto-derive as 2x qty.")
+                        help="Per-venue position ceiling (unsigned qty). At |pos|>=limit "
+                             "on either venue we enter reduce-only mode and stay there "
+                             "until BOTH venues are flat. 0 means auto-derive as 2x qty.")
     parser.add_argument("--signal-strict", action="store_true",
                         help="Require adjusted > max(5m,30m,1h) instead of any().")
     parser.add_argument("--var-order-timeout-ms", type=int, default=5000)
