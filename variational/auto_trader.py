@@ -186,10 +186,6 @@ class VarPlaceResult:
     raw_body: str | None = None
     latency_ms: int | None = None
     error: str | None = None
-    # Indicative price from the RFQ response (bid for sell-close, ask for buy-close).
-    # Used by close path to update position tracker directly since Variational's
-    # /events WS does not appear to push reduce-only trade events.
-    fill_price: Decimal | None = None
 
 
 # ---------- AutoTrader class skeleton (with gates; _fire stubbed) ----------
@@ -233,11 +229,6 @@ class AutoTrader:
         # position_limit * reduce_only_resume_fraction (default 50%).
         self._close_mode = False
         self._close_in_progress = False
-        # rfq_ids of closes where we've already applied the Var position
-        # update directly from close_ack (since /events WS doesn't push
-        # reduce-only trades). If a delayed WS trade event arrives with this
-        # rfq_id, skip it to avoid double-counting.
-        self._close_var_applied_rfqs: set[str] = set()
 
         # Per-venue position accounting for close PnL computation.
         # _*_pos_qty is signed (+long, -short). avg is cost basis (unsigned).
@@ -312,14 +303,6 @@ class AutoTrader:
         abs_net = max(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
         limit = self.config.position_limit
         resume_at = limit * self.config.reduce_only_resume_fraction
-        # Safety-net: if one side is 0, paired close can't proceed regardless
-        # of the other side's magnitude. Exit close_mode and let normal ops
-        # resume; any residual naked position will be diluted by subsequent
-        # cycles. Prevents the "one side drained to zero while other still
-        # has residual" deadlock.
-        one_side_zero = self._close_mode and (
-            self._var_pos_qty == 0 or self._lighter_pos_qty == 0
-        )
         if not self._close_mode and abs_net >= limit:
             self._close_mode = True
             self.logger.warning(
@@ -328,12 +311,12 @@ class AutoTrader:
                 "when close_pnl >= 0 until |pos| <= %s.",
                 self._var_pos_qty, self._lighter_pos_qty, limit, resume_at,
             )
-        elif self._close_mode and (abs_net <= resume_at or one_side_zero):
+        elif self._close_mode and abs_net <= resume_at:
             self._close_mode = False
             self.logger.info(
-                "Exiting close mode: var_pos=%s lighter_pos=%s resume_at=%s "
-                "one_side_zero=%s. Resuming normal cycle dispatch.",
-                self._var_pos_qty, self._lighter_pos_qty, resume_at, one_side_zero,
+                "Exiting close mode: var_pos=%s lighter_pos=%s resume_at=%s. "
+                "Resuming normal cycle dispatch.",
+                self._var_pos_qty, self._lighter_pos_qty, resume_at,
             )
 
     def _maybe_rollover(self) -> None:
@@ -590,12 +573,6 @@ class AutoTrader:
         whether the fill belongs to a tracked cycle or to a close order),
         then routes to a cycle if the correlation key matches.
         """
-        # Dedup: if this trade is from a close whose position update was
-        # already applied via close_ack, skip. Covers the case where a
-        # delayed /events WS trade for a reduce-only close does arrive and
-        # would otherwise double-count.
-        if trade_id and trade_id in self._close_var_applied_rfqs:
-            return
         if side is not None:
             signed = fill_qty if side.lower() == "buy" else -fill_qty
             realized = self._update_venue_position("var", signed, fill_px)
@@ -808,31 +785,6 @@ class AutoTrader:
                          else getattr(var_res, "error", None))
             lig_error = (str(lig_res) if isinstance(lig_res, Exception)
                          else getattr(lig_res, "error", None))
-
-            # Variational's /events WS does NOT reliably push trade events
-            # for reduce-only closes via /api/quotes/accept. Apply the Var
-            # position update directly from the ack — close_ack is the
-            # authoritative confirmation that Var accepted the close at the
-            # quoted price. This is the critical fix: without it, the
-            # AutoTrader's _var_pos_qty never shrinks from closes and
-            # _update_mode's max(|var|, |lighter|) stays large, causing
-            # close_mode to be stuck forever.
-            if var_ok and not isinstance(var_res, Exception):
-                var_signed = qty if var_side == "buy" else -qty
-                var_fill_px = getattr(var_res, "fill_price", None) or self._var_pos_avg
-                realized = self._update_venue_position("var", var_signed, var_fill_px)
-                self.stats.var_volume_usd += var_fill_px * qty
-                self.stats.var_realized_pnl += realized
-                rfq_id = getattr(var_res, "trade_id", None)
-                if rfq_id:
-                    self._close_var_applied_rfqs.add(rfq_id)
-                async with self._lock:
-                    self._update_mode()
-
-            # Lighter position updates still flow through account_orders WS
-            # → handle_lighter_fill_update → on_lighter_fill, which does
-            # update _lighter_pos_qty and call _update_mode. We don't need
-            # to double-apply here for Lighter.
 
             self.events.emit({
                 "ts": _utc_now_iso(), "event": "close_ack",
