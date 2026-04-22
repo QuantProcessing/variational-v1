@@ -356,7 +356,14 @@ class LighterAdapterImpl:
                 )
             if error is not None:
                 return LighterPlaceResult(ok=False, client_order_id=client_order_id, error=f"sign: {error}")
-            return LighterPlaceResult(ok=True, client_order_id=client_order_id, tx_hash=tx_hash)
+            # Lighter SDK returns a RespSendTx object for tx_hash. Stringify
+            # now so downstream consumers (cycle_pnl row, trade_records.csv)
+            # can JSON-serialize without a custom encoder.
+            return LighterPlaceResult(
+                ok=True,
+                client_order_id=client_order_id,
+                tx_hash=str(tx_hash) if tx_hash is not None else None,
+            )
         except Exception as exc:
             return LighterPlaceResult(ok=False, client_order_id=client_order_id, error=f"exception: {exc}")
 

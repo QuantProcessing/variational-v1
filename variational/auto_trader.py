@@ -32,6 +32,13 @@ CLOSE_BOOK_FRACTION = Decimal("0.3")
 # asks for more than one venue can reduce_only close.
 QTY_QUANTUM = Decimal("0.01")
 
+# Lighter rejects below-min-notional orders (code 21706 "invalid order base
+# or quote amount"). For HYPE at ~$40 the floor is ~0.2-0.3 qty. If a paired
+# close leaves a sub-min residual on one venue we stop retrying — the
+# exchange just keeps bouncing it — and exit close_mode so signal fires can
+# resume. The dust stays on-exchange; user cleans up manually on the venue UI.
+RESIDUAL_DUST_QTY = Decimal("0.5")
+
 
 def quantize_qty(qty: Decimal) -> Decimal:
     return qty.quantize(QTY_QUANTUM, rounding=ROUND_DOWN)
@@ -715,7 +722,22 @@ class AutoTrader:
         # If one side is 0, paired close is impossible. Kick off a residual
         # handler that queries actual positions from both venues and fires a
         # single-venue reduce-only close on whichever side still has inventory.
+        # Exception: if the remaining residual is below the venue's min order
+        # size (RESIDUAL_DUST_QTY), Lighter rejects every close attempt with
+        # code=21706 and we'd spin here forever. Give up, exit close_mode,
+        # let signal fires resume. User cleans the dust manually.
         if self._var_pos_qty == 0 or self._lighter_pos_qty == 0:
+            residual = abs(self._var_pos_qty) + abs(self._lighter_pos_qty)
+            if residual < RESIDUAL_DUST_QTY:
+                async with self._lock:
+                    if self._close_mode:
+                        self._close_mode = False
+                        self.logger.warning(
+                            "Residual var=%s lighter=%s below dust threshold %s; "
+                            "exiting close_mode. Close manually on the venue UI.",
+                            self._var_pos_qty, self._lighter_pos_qty, RESIDUAL_DUST_QTY,
+                        )
+                return
             if not self._close_in_progress:
                 self._close_in_progress = True
                 asyncio.create_task(self._handle_close_mode_residual(asset))
