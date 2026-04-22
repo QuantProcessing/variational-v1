@@ -13,7 +13,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Optional
 
 from variational.journal import EventJournal
@@ -24,6 +24,16 @@ from variational.signal import SignalEngine, SignalState
 # our 30%, not pushing us to deeper/worse levels. Successive WS ticks will
 # re-fire until position is fully drained.
 CLOSE_BOOK_FRACTION = Decimal("0.3")
+
+# Quantize order qty to 2 decimals (ROUND_DOWN) before dispatch. Both
+# Variational and Lighter HYPE markets use 0.01 tick; identical quantization
+# on both sides prevents the "3.87 vs 3.833" symmetry break where tracker
+# asks for more than one venue can reduce_only close.
+QTY_QUANTUM = Decimal("0.01")
+
+
+def quantize_qty(qty: Decimal) -> Decimal:
+    return qty.quantize(QTY_QUANTUM, rounding=ROUND_DOWN)
 
 
 def _utc_now_iso() -> str:
@@ -368,8 +378,10 @@ class AutoTrader:
             signal_snapshot=state,
             plan=plan,
         )
-        cycle.var_leg.requested_qty = self.config.qty
-        cycle.lighter_leg.requested_qty = self.config.qty
+        # Quantize to 2dp so both venues get the identical qty string.
+        open_qty = quantize_qty(self.config.qty)
+        cycle.var_leg.requested_qty = open_qty
+        cycle.lighter_leg.requested_qty = open_qty
 
         signed_commitment = self.config.qty if direction == "long_var_short_lighter" else -self.config.qty
         async with self._lock:
@@ -727,7 +739,8 @@ class AutoTrader:
         # Only consume 30% of Lighter top-of-book qty per attempt — competitors
         # snapping up the level can eat ~70% without pushing us to worse levels.
         # Successive WS ticks re-fire until position is drained.
-        close_qty = min(closable, top_qty * CLOSE_BOOK_FRACTION)
+        # Quantize to 2dp so Var RFQ and Lighter limit get the identical qty.
+        close_qty = quantize_qty(min(closable, top_qty * CLOSE_BOOK_FRACTION))
         if close_qty <= 0:
             return
 
