@@ -53,7 +53,6 @@ class AutoTraderConfig:
     throttle_seconds: float = 3.0
     max_trades_per_day: int = 200
     position_limit: Decimal = Decimal("0")
-    reduce_only_resume_fraction: Decimal = Decimal("0.5")
     leg_settle_timeout_sec: float = 10.0
     var_order_timeout_ms: int = 5000
     hedge_slippage_bps: float = 100.0
@@ -250,8 +249,9 @@ class AutoTrader:
 
         # Hysteresis: once |net_qty| reaches position_limit we enter close mode
         # (signal fires paused; WS ticks drive active reduce-only closes when
-        # close PnL >= 0). Exit close mode when |net_qty| drops below
-        # position_limit * reduce_only_resume_fraction (default 50%).
+        # close PnL >= 0). Exit close mode only when BOTH venues are fully
+        # flat — resuming while still carrying inventory just cycles back up
+        # to the limit and pays the open→close slippage round-trip again.
         self._close_mode = False
         self._close_in_progress = False
 
@@ -329,24 +329,29 @@ class AutoTrader:
         return net
 
     def _update_mode(self) -> None:
-        """Recompute close-mode state from actual filled venue positions."""
+        """Recompute close-mode state from actual filled venue positions.
+
+        Enter at |pos| >= limit; exit only when BOTH venues are flat
+        (<= QTY_QUANTUM to ignore dust). Flat-only exit prevents the
+        open→close oscillation where we close halfway, re-fire, and pay
+        the round-trip slippage repeatedly.
+        """
         abs_net = max(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
         limit = self.config.position_limit
-        resume_at = limit * self.config.reduce_only_resume_fraction
         if not self._close_mode and abs_net >= limit:
             self._close_mode = True
             self.logger.warning(
                 "Entering close mode: var_pos=%s lighter_pos=%s limit=%s. "
                 "Signal fires paused; WS ticks drive reduce-only closes "
-                "when close_pnl >= 0 until |pos| <= %s.",
-                self._var_pos_qty, self._lighter_pos_qty, limit, resume_at,
+                "when close_pnl >= 0 until BOTH venues are flat.",
+                self._var_pos_qty, self._lighter_pos_qty, limit,
             )
-        elif self._close_mode and abs_net <= resume_at:
+        elif self._close_mode and abs_net <= QTY_QUANTUM:
             self._close_mode = False
             self.logger.info(
-                "Exiting close mode: var_pos=%s lighter_pos=%s resume_at=%s. "
-                "Resuming normal cycle dispatch.",
-                self._var_pos_qty, self._lighter_pos_qty, resume_at,
+                "Exiting close mode: var_pos=%s lighter_pos=%s. "
+                "Position flat; resuming normal cycle dispatch.",
+                self._var_pos_qty, self._lighter_pos_qty,
             )
 
     def _maybe_rollover(self) -> None:
