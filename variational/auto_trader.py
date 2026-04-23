@@ -123,6 +123,29 @@ class LighterLegState(LegState):
 
 
 @dataclass(slots=True)
+class CloseLegs:
+    """Aggregate fills from the close (unwind) phase, attached back to the
+    opening TradeCycle so round-trip PnL is observable without cross-referencing
+    order_events.jsonl. Close may fire in 1..N batches (chunked or residual);
+    fields are VWAP-style aggregates across all fills on each side.
+    """
+    var_rfq_ids: list[str] = field(default_factory=list)
+    lighter_client_order_ids: list[int] = field(default_factory=list)
+    var_filled_qty: Decimal = Decimal("0")
+    var_avg_fill_px: Decimal | None = None
+    lighter_filled_qty: Decimal = Decimal("0")
+    lighter_avg_fill_px: Decimal | None = None
+    first_close_at: str | None = None
+    last_close_at: str | None = None
+    # Premium at the moment of the final close attempt that took position flat.
+    exit_premium_bp: float | None = None
+    # Round-trip PnL in basis points, computed from actual fills only (no
+    # venue fees since both are zero). Positive = profit.
+    round_trip_pnl_bp: float | None = None
+    fully_closed_at: str | None = None
+
+
+@dataclass(slots=True)
 class TradeCycle:
     cycle_id: str
     asset: str
@@ -134,6 +157,7 @@ class TradeCycle:
     plan: TradePlan | None = None
     var_leg: VarLegState = field(default_factory=VarLegState)
     lighter_leg: LighterLegState = field(default_factory=LighterLegState)
+    close: CloseLegs = field(default_factory=CloseLegs)
     status: str = "opening"
     reason_codes: list[str] = field(default_factory=list)
 
@@ -240,6 +264,7 @@ class AutoTrader:
         config: AutoTraderConfig,
         events_journal: EventJournal,
         cycles_journal: EventJournal,
+        round_trips_journal: EventJournal | None = None,
         logger: logging.Logger,
     ) -> None:
         self.var_placer = var_placer
@@ -247,7 +272,17 @@ class AutoTrader:
         self.config = config
         self.events = events_journal
         self.cycles = cycles_journal
+        # Optional dedicated journal for completed round-trips (open+close
+        # merged). If None, round-trip records also go to cycles_journal
+        # tagged as status="round_trip_closed".
+        self.round_trips = round_trips_journal
         self.logger = logger
+
+        # Pointer to the cycle currently holding a position. Set after a
+        # successful open and used to route close fills (which have their
+        # own rfq/co_id) back to the same row. With max 1 concurrent
+        # position, there's never ambiguity.
+        self._active_open_cycle: TradeCycle | None = None
 
         self.stats = TraderStats(_day_key=_today_key())
         self._last_fire_monotonic: float = 0.0
@@ -381,6 +416,7 @@ class AutoTrader:
             self._recent_cycles.appendleft(cycle)
             self._last_fire_monotonic = now_mono
             self.stats.trades_today += 1
+            self._active_open_cycle = cycle
 
         self.events.emit({
             "ts": now_iso, "event": "cycle_opened", "cycle_id": cycle_id,
@@ -593,6 +629,15 @@ class AutoTrader:
             self._update_venue_position("var", signed, fill_px)
             self.stats.var_volume_usd += fill_px * fill_qty
 
+        # If this rfq matches the active cycle's close, apply it as a close-leg
+        # fill rather than an open-leg fill. Close fills aggregate VWAP-style.
+        if rfq_id:
+            active = self._active_open_cycle
+            if active is not None and rfq_id in active.close.var_rfq_ids:
+                self._apply_close_var_fill(active, fill_px, fill_qty)
+                await self._maybe_finalize_round_trip(active)
+                return
+
         if not rfq_id:
             return  # close order without correlation — position updated above
 
@@ -630,6 +675,14 @@ class AutoTrader:
             signed = fill_qty if side.upper() == "BUY" else -fill_qty
             self._update_venue_position("lighter", signed, fill_px)
             self.stats.lighter_volume_usd += fill_px * fill_qty
+
+        # Close fill routing: active cycle registers every close co_id it fires.
+        active = self._active_open_cycle
+        if active is not None and client_order_id in active.close.lighter_client_order_ids:
+            self._apply_close_lighter_fill(active, fill_px, fill_qty)
+            await self._maybe_finalize_round_trip(active)
+            return
+
         async with self._lock:
             cycle_id = self._lighter_order_to_cycle.get(client_order_id)
             cycle = self._open_cycles.get(cycle_id) if cycle_id else None
@@ -755,6 +808,19 @@ class AutoTrader:
                 while co_id in self._lighter_order_to_cycle:
                     co_id += 1
 
+            # Pre-register lighter co_id → active cycle so on_lighter_fill can
+            # route the close fill back to the TradeCycle (same pattern as open).
+            active = self._active_open_cycle
+            if active is not None:
+                async with self._lock:
+                    self._lighter_order_to_cycle[co_id] = active.cycle_id
+                    active.close.lighter_client_order_ids.append(co_id)
+                    if active.close.first_close_at is None:
+                        active.close.first_close_at = t0_iso
+                    active.close.last_close_at = t0_iso
+                    if exit_premium_bp is not None:
+                        active.close.exit_premium_bp = exit_premium_bp
+
             # Fire both legs in parallel; both reduce-only.
             var_task = asyncio.create_task(self.var_placer.place_close_order(
                 side=var_side, qty=qty, asset=asset,
@@ -773,11 +839,24 @@ class AutoTrader:
             lig_error = (str(lig_res) if isinstance(lig_res, Exception)
                          else getattr(lig_res, "error", None))
 
+            # Close Var's trade_id is the close rfq_id — stash on active cycle
+            # so on_variational_fill can route the close fill back.
+            var_trade_id = (
+                None if isinstance(var_res, Exception)
+                else getattr(var_res, "trade_id", None)
+            )
+            if active is not None and var_trade_id:
+                async with self._lock:
+                    if var_trade_id not in active.close.var_rfq_ids:
+                        active.close.var_rfq_ids.append(str(var_trade_id))
+
             self.events.emit({
                 "ts": _utc_now_iso(), "event": "close_ack",
                 "qty": _dec_str(qty),
                 "var_ok": var_ok, "var_error": var_error,
+                "var_close_rfq_id": var_trade_id,
                 "lighter_ok": lig_ok, "lighter_error": lig_error,
+                "lighter_close_co_id": co_id,
                 "var_pos_after": _dec_str(self._var_pos_qty),
                 "lighter_pos_after": _dec_str(self._lighter_pos_qty),
             })
@@ -943,6 +1022,97 @@ class AutoTrader:
         leg.filled_at = _utc_now_iso()
         if leg.filled_qty >= leg.requested_qty:
             leg.terminal = True
+
+    def _apply_close_var_fill(
+        self, cycle: TradeCycle, fill_px: Decimal, fill_qty: Decimal,
+    ) -> None:
+        c = cycle.close
+        prior = c.var_filled_qty
+        c.var_filled_qty += fill_qty
+        if c.var_avg_fill_px is None:
+            c.var_avg_fill_px = fill_px
+        else:
+            c.var_avg_fill_px = ((c.var_avg_fill_px * prior) + (fill_px * fill_qty)) / c.var_filled_qty
+        c.last_close_at = _utc_now_iso()
+        self.events.emit({
+            "ts": c.last_close_at, "event": "close_var_fill",
+            "cycle_id": cycle.cycle_id, "fill_px": _dec_str(fill_px),
+            "fill_qty": _dec_str(fill_qty),
+        })
+
+    def _apply_close_lighter_fill(
+        self, cycle: TradeCycle, fill_px: Decimal, fill_qty: Decimal,
+    ) -> None:
+        c = cycle.close
+        prior = c.lighter_filled_qty
+        c.lighter_filled_qty += fill_qty
+        if c.lighter_avg_fill_px is None:
+            c.lighter_avg_fill_px = fill_px
+        else:
+            c.lighter_avg_fill_px = (
+                (c.lighter_avg_fill_px * prior) + (fill_px * fill_qty)
+            ) / c.lighter_filled_qty
+        c.last_close_at = _utc_now_iso()
+        self.events.emit({
+            "ts": c.last_close_at, "event": "close_lighter_fill",
+            "cycle_id": cycle.cycle_id, "fill_px": _dec_str(fill_px),
+            "fill_qty": _dec_str(fill_qty),
+        })
+
+    async def _maybe_finalize_round_trip(self, cycle: TradeCycle) -> None:
+        """Call after any close fill. If both venue positions are flat and
+        the active cycle's close qty matches its open qty, compute the
+        round-trip PnL, emit a round_trip_closed record, and clear the
+        active-cycle pointer so the next open can fire."""
+        # Position must be fully flat before we declare the round-trip done.
+        if abs(self._var_pos_qty) > QTY_QUANTUM:
+            return
+        if abs(self._lighter_pos_qty) > QTY_QUANTUM:
+            return
+        if self._active_open_cycle is not cycle:
+            return
+
+        # Compute round-trip PnL from actual fills. Both venues zero-fee.
+        # Short-var/long-lighter: open-leg cash = open_var - open_lighter
+        #                         close cash   = close_lighter - close_var
+        open_v = cycle.var_leg.avg_fill_px
+        open_l = cycle.lighter_leg.avg_fill_px
+        close_v = cycle.close.var_avg_fill_px
+        close_l = cycle.close.lighter_avg_fill_px
+        pnl_bp: float | None = None
+        if all(x is not None for x in (open_v, open_l, close_v, close_l)) and open_l != 0:
+            pnl_per_unit = (open_v - close_v) + (close_l - open_l)
+            pnl_bp = float(pnl_per_unit / open_l) * 10000.0
+            cycle.close.round_trip_pnl_bp = pnl_bp
+        cycle.close.fully_closed_at = _utc_now_iso()
+
+        row = {
+            "ts": cycle.close.fully_closed_at,
+            "event": "round_trip_closed",
+            "cycle_id": cycle.cycle_id,
+            "asset": cycle.asset,
+            "entry_premium_bp": cycle.entry_premium_bp,
+            "exit_premium_bp": cycle.close.exit_premium_bp,
+            "open_var_px": _dec_str(open_v),
+            "open_lighter_px": _dec_str(open_l),
+            "close_var_px": _dec_str(close_v),
+            "close_lighter_px": _dec_str(close_l),
+            "qty": _dec_str(cycle.var_leg.requested_qty),
+            "round_trip_pnl_bp": pnl_bp,
+            "opened_at": cycle.opened_at,
+            "first_close_at": cycle.close.first_close_at,
+            "fully_closed_at": cycle.close.fully_closed_at,
+        }
+        target_journal = self.round_trips if self.round_trips is not None else self.cycles
+        target_journal.emit(row)
+        self.events.emit({
+            "ts": cycle.close.fully_closed_at,
+            "event": "round_trip_closed",
+            "cycle_id": cycle.cycle_id,
+            "round_trip_pnl_bp": pnl_bp,
+        })
+
+        self._active_open_cycle = None
 
     async def _settle_cycle_when_done(self, cycle: TradeCycle) -> None:
         deadline = asyncio.get_running_loop().time() + self.config.leg_settle_timeout_sec

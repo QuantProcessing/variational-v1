@@ -451,6 +451,10 @@ class VariationalToLighterRuntime:
         self.market_ticks_journal = EventJournal(self.market_ticks_file)
         self.events_journal = EventJournal(LOG_DIR / "order_events.jsonl")
         self.cycles_journal = EventJournal(LOG_DIR / "cycle_pnl.jsonl")
+        # Dedicated journal for fully-closed round-trips (open + close merged,
+        # true PnL computed from actual fills). cycle_pnl.jsonl only tracks
+        # open-side; this file is the row-per-round-trip authoritative record.
+        self.round_trips_journal = EventJournal(LOG_DIR / "round_trips.jsonl")
         self.auto_trader: AutoTrader | None = None
         self.cmd_client: VariationalCmdClient | None = None
         self._trade_csv_write_lock = asyncio.Lock()
@@ -1131,12 +1135,14 @@ class VariationalToLighterRuntime:
         col_state = "状态" if is_zh else "State"
         orders_title = "最近订单（最新在前）" if is_zh else "Recent Orders (latest first)"
         col_trade_id = "订单ID" if is_zh else "Trade ID"
-        col_side = "方向" if is_zh else "Side"
         col_qty = "数量" if is_zh else "Qty"
-        col_var_fill_px = "Var 成交价" if is_zh else "Var Fill Px"
-        col_lighter_fill_px = "Lighter 成交价" if is_zh else "Lighter Fill Px"
-        col_fill_diff = "成交价差(按方向)" if is_zh else "Fill Diff (Directional)"
-        col_fill_diff_pct = "成交价差%(按方向)" if is_zh else "Fill Diff % (Directional)"
+        col_var_open = "Var 开" if is_zh else "Var Open"
+        col_var_close = "Var 平" if is_zh else "Var Close"
+        col_lig_open = "Lighter 开" if is_zh else "Lighter Open"
+        col_lig_close = "Lighter 平" if is_zh else "Lighter Close"
+        col_entry_bp = "开 bp" if is_zh else "Entry bp"
+        col_exit_bp = "平 bp" if is_zh else "Exit bp"
+        col_rt_pnl_bp = "RT PnL bp" if is_zh else "RT PnL bp"
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
         variational_label = "Variational"
         lighter_label = "Lighter"
@@ -1212,43 +1218,42 @@ class VariationalToLighterRuntime:
 
         orders_table = Table(title=orders_title, show_header=True, expand=True)
         orders_table.add_column(col_trade_id)
-        orders_table.add_column(col_side)
         orders_table.add_column(col_qty, justify="right")
-        orders_table.add_column(col_var_fill_px, justify="right")
-        orders_table.add_column(col_lighter_fill_px, justify="right")
-        orders_table.add_column(col_fill_diff, justify="right")
-        orders_table.add_column(col_fill_diff_pct, justify="right")
+        orders_table.add_column(col_var_open, justify="right")
+        orders_table.add_column(col_var_close, justify="right")
+        orders_table.add_column(col_lig_open, justify="right")
+        orders_table.add_column(col_lig_close, justify="right")
+        orders_table.add_column(col_entry_bp, justify="right")
+        orders_table.add_column(col_exit_bp, justify="right")
+        orders_table.add_column(col_rt_pnl_bp, justify="right")
+
+        def _fmt_signed_bp(v):
+            return "-" if v is None else f"{v:+.2f}"
+
+        def _fmt_pnl_bp(v):
+            if v is None:
+                return "-"
+            color = "green" if v > 0 else "red"
+            return f"[{color}]{v:+.2f}[/{color}]"
 
         if not rows:
-            orders_table.add_row(
-                no_orders_text,
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-            )
+            orders_table.add_row(no_orders_text, *(["-"] * 8))
         else:
             for cycle in rows:
                 trade_display = (
                     cycle.var_leg.trade_id[:10] if cycle.var_leg.trade_id
                     else cycle.cycle_id[-10:]
                 )
-                var_px = cycle.var_leg.avg_fill_px
-                lig_px = cycle.lighter_leg.avg_fill_px
-                fill_diff, fill_diff_pct = self._fill_diff_short_var(var_px, lig_px)
-                side_display = (
-                    "做空 Var / 做多 Lighter" if is_zh else "Short Var / Long Lighter"
-                )
                 orders_table.add_row(
                     trade_display,
-                    side_display,
                     self._fmt_price(cycle.var_leg.requested_qty),
-                    self._fmt_price(var_px),
-                    self._fmt_price(lig_px),
-                    self._fmt_price(fill_diff),
-                    self._fmt_pct(fill_diff_pct),
+                    self._fmt_price(cycle.var_leg.avg_fill_px),
+                    self._fmt_price(cycle.close.var_avg_fill_px),
+                    self._fmt_price(cycle.lighter_leg.avg_fill_px),
+                    self._fmt_price(cycle.close.lighter_avg_fill_px),
+                    _fmt_signed_bp(cycle.entry_premium_bp),
+                    _fmt_signed_bp(cycle.close.exit_premium_bp),
+                    _fmt_pnl_bp(cycle.close.round_trip_pnl_bp),
                 )
 
         stats = self.auto_trader.snapshot() if self.auto_trader is not None else None
@@ -1257,6 +1262,7 @@ class VariationalToLighterRuntime:
                 self.market_ticks_journal.dropped_count
                 + self.events_journal.dropped_count
                 + self.cycles_journal.dropped_count
+                + self.round_trips_journal.dropped_count
             )
             frozen_suffix = "" if not stats.frozen else f"  \u26a0 FROZEN[{stats.frozen_reason}]"
             if dropped == 0:
@@ -1371,32 +1377,31 @@ class VariationalToLighterRuntime:
         cycles = self.auto_trader.get_recent_cycles()
         rows: list[dict[str, Any]] = []
         for cycle in cycles:
-            var_px = cycle.var_leg.avg_fill_px
-            lig_px = cycle.lighter_leg.avg_fill_px
-            fill_diff, fill_diff_pct = self._fill_diff_short_var(var_px, lig_px)
             rows.append(
                 {
                     "cycle_id": cycle.cycle_id,
                     "opened_at": cycle.opened_at,
-                    "closed_at": cycle.closed_at,
+                    "fully_closed_at": cycle.close.fully_closed_at,
                     "asset": cycle.asset,
-                    "entry_premium_bp": cycle.entry_premium_bp,
                     "status": cycle.status,
                     "qty_target": decimal_to_str(cycle.var_leg.requested_qty),
+                    "entry_premium_bp": cycle.entry_premium_bp,
+                    "exit_premium_bp": cycle.close.exit_premium_bp,
+                    "round_trip_pnl_bp": cycle.close.round_trip_pnl_bp,
+                    "open_var_fill_px": decimal_to_str(cycle.var_leg.avg_fill_px),
+                    "close_var_fill_px": decimal_to_str(cycle.close.var_avg_fill_px),
+                    "open_lighter_fill_px": decimal_to_str(cycle.lighter_leg.avg_fill_px),
+                    "close_lighter_fill_px": decimal_to_str(cycle.close.lighter_avg_fill_px),
                     "var_rfq_id": cycle.var_leg.rfq_id,
                     "var_trade_id": cycle.var_leg.trade_id,
                     "var_filled_qty": decimal_to_str(cycle.var_leg.filled_qty),
-                    "var_fill_px": decimal_to_str(var_px),
-                    "var_filled_at": cycle.var_leg.filled_at,
-                    "var_error": cycle.var_leg.error,
+                    "close_var_filled_qty": decimal_to_str(cycle.close.var_filled_qty),
                     "lighter_client_order_id": cycle.lighter_leg.client_order_id,
                     "lighter_filled_qty": decimal_to_str(cycle.lighter_leg.filled_qty),
-                    "lighter_fill_px": decimal_to_str(lig_px),
-                    "lighter_filled_at": cycle.lighter_leg.filled_at,
+                    "close_lighter_filled_qty": decimal_to_str(cycle.close.lighter_filled_qty),
                     "lighter_tx_hash": cycle.lighter_leg.tx_hash,
+                    "var_error": cycle.var_leg.error,
                     "lighter_error": cycle.lighter_leg.error,
-                    "fill_diff": decimal_to_str(fill_diff),
-                    "fill_diff_pct": decimal_to_str(fill_diff_pct),
                     "reason_codes": ",".join(cycle.reason_codes) if cycle.reason_codes else "",
                 }
             )
@@ -1408,25 +1413,27 @@ class VariationalToLighterRuntime:
         fieldnames = [
             "cycle_id",
             "opened_at",
-            "closed_at",
+            "fully_closed_at",
             "asset",
-            "entry_premium_bp",
             "status",
             "qty_target",
+            "entry_premium_bp",
+            "exit_premium_bp",
+            "round_trip_pnl_bp",
+            "open_var_fill_px",
+            "close_var_fill_px",
+            "open_lighter_fill_px",
+            "close_lighter_fill_px",
             "var_rfq_id",
             "var_trade_id",
             "var_filled_qty",
-            "var_fill_px",
-            "var_filled_at",
-            "var_error",
+            "close_var_filled_qty",
             "lighter_client_order_id",
             "lighter_filled_qty",
-            "lighter_fill_px",
-            "lighter_filled_at",
+            "close_lighter_filled_qty",
             "lighter_tx_hash",
+            "var_error",
             "lighter_error",
-            "fill_diff",
-            "fill_diff_pct",
             "reason_codes",
         ]
         async with self._trade_csv_write_lock:
@@ -1484,6 +1491,7 @@ class VariationalToLighterRuntime:
         await self.market_ticks_journal.start()
         await self.events_journal.start()
         await self.cycles_journal.start()
+        await self.round_trips_journal.start()
         self.print_startup_next_steps()
         self.logger.info(
             "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s",
@@ -1519,6 +1527,7 @@ class VariationalToLighterRuntime:
             config=self.auto_trader_config,
             events_journal=self.events_journal,
             cycles_journal=self.cycles_journal,
+            round_trips_journal=self.round_trips_journal,
             logger=self.logger,
         )
         self.logger.info(
@@ -1567,6 +1576,7 @@ class VariationalToLighterRuntime:
         await self.market_ticks_journal.stop()
         await self.events_journal.stop()
         await self.cycles_journal.stop()
+        await self.round_trips_journal.stop()
         if self.cmd_client is not None:
             await self.cmd_client.stop()
 
