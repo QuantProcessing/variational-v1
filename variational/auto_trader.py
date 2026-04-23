@@ -27,11 +27,14 @@ from typing import Any
 from variational.journal import EventJournal
 from variational.signal import MarketState
 
-# Fraction of Lighter top-of-book qty to consume per close attempt. Leaving
-# 70% on the book means competitors eating the level ahead of us only eats
-# our 30%, not pushing us to deeper/worse levels. Successive WS ticks will
-# re-fire until position is fully drained.
-CLOSE_BOOK_FRACTION = Decimal("0.3")
+# Fraction of Lighter top-of-book qty to consume per close attempt. Setting
+# to 1.0 means one-shot close: request full remaining qty in a single paired
+# order, paying one round of Var RFQ slippage instead of N. Lighter may walk
+# one or two levels deep if top isn't enough; that's cheaper than chunking
+# through N RFQ calls. A previous value (0.3) was meant to limit exposure to
+# level-skip by competitors, but at our qty scale it multiplied RFQ slippage
+# and produced sub-min residuals that stalled at Lighter code=21706.
+CLOSE_BOOK_FRACTION = Decimal("1.0")
 
 # Quantize order qty to 2 decimals (ROUND_DOWN) before dispatch. Both
 # Variational and Lighter HYPE markets use 0.01 tick; identical quantization
