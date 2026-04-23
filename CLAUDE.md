@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 工作原则（必读）
+
+**不要打补丁，要从全局视角考虑问题。**
+
+当发现 bug、低效、架构别扭时，先问一次："这是局部补丁能修好的，还是整个设计方向错了？"。如果是后者，停下来，重新想，而不是在旧设计上再加一层。典型的打补丁味道：cache + TTL + 过期 fallback、fast-path / slow-path 双流、"兜底参数"、一堆 CLI flag 来绕过已经错的默认行为。这类每一次"加一个东西让它能工作"，都是在欠更多架构债。
+
+优先做减法。需求可以用"再加一层"满足的话，先尝试用"去掉一层"是否也能满足。
+
 ## Commands
 
 Environment setup (Python 3.10+ required due to `slots=True` / PEP 604 types):

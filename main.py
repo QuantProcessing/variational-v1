@@ -65,7 +65,9 @@ POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
 DASHBOARD_ORDERS = 8
-ASSET_SWITCH_CONFIRM_TICKS = 3
+# How often we actively POST /api/quotes/indicative at our trade qty. This is
+# the Var-side MarketUpdate rate; every successful poll triggers signal eval.
+VAR_POLL_INTERVAL_SECONDS = 1.0
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
 LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
@@ -181,12 +183,20 @@ class VariationalRuntime:
 
 
 class VariationalPlacerImpl:
-    """Two-step RFQ flow: /api/quotes/indicative → /api/orders/new/market.
+    """Submit Variational market orders.
 
-    Variational wants a quote_id before accepting a market order, so we request
-    an indicative quote for the exact (asset, qty), then pass its quote_id to
-    the order endpoint with side + max_slippage. The response's rfq_id becomes
-    the correlation key for matching fills streamed over /events WS.
+    Open path (``place_order``): the runtime's var_poll_loop keeps a fresh
+    quote_id live at our exact trade qty. The placer reuses that quote_id
+    directly and only makes ONE HTTP call — ``/api/orders/new/market``. If
+    the poller hasn't published a quote_id yet (startup, cmd-broker down,
+    Variational down), the call fails; there is no fallback.
+
+    Close path (``place_close_order``): the close qty differs from the
+    poller qty, so no cached quote_id applies. Close does the full two-step
+    (``/api/quotes/indicative`` → ``/api/quotes/accept``).
+
+    The response's rfq_id is the correlation key AutoTrader uses to match
+    fills on /events WS.
     """
 
     def __init__(
@@ -194,18 +204,74 @@ class VariationalPlacerImpl:
         cmd: VariationalCmdClient,
         max_slippage: float,
         logger: logging.Logger,
+        get_quote_id: Any,
     ) -> None:
         self.cmd = cmd
         self.max_slippage = max_slippage
         self.logger = logger
+        # Callable() -> str | None. Returns the latest quote_id the poller
+        # fetched at our trade qty, or None if the poller hasn't succeeded
+        # yet. The placer trusts this blindly — no TTL check, no staleness
+        # guard — because the poller runs continuously at VAR_POLL_INTERVAL.
+        self.get_quote_id = get_quote_id
 
-    async def _rfq_then_submit(
-        self, side: str, qty: Decimal, asset: str, timeout_ms: int,
-        submit_url: str, is_reduce_only: bool,
+    async def _submit_with_quote_id(
+        self, *, quote_id: str, side: str, submit_url: str,
+        is_reduce_only: bool, timeout_ms: int,
     ) -> VarPlaceResult:
         import json as _json
+        body = _json.dumps({
+            "quote_id": quote_id,
+            "side": side,
+            "max_slippage": self.max_slippage,
+            "is_reduce_only": is_reduce_only,
+        })
+        res = await self.cmd.execute_fetch(
+            url=submit_url, method="POST",
+            headers={"content-type": "application/json"},
+            body=body, timeout_ms=timeout_ms,
+        )
+        if not res.ok or (res.status is not None and res.status >= 400):
+            return VarPlaceResult(
+                ok=False, raw_status=res.status, raw_body=res.body,
+                latency_ms=res.latency_ms,
+                error=res.error or f"order_http_{res.status}",
+                request_id=res.request_id,
+            )
+        rfq_id: str | None = None
+        try:
+            parsed = _json.loads(res.body or "{}")
+            if isinstance(parsed, dict):
+                raw = parsed.get("rfq_id")
+                rfq_id = str(raw) if raw else None
+        except Exception:
+            pass
+        if not rfq_id:
+            return VarPlaceResult(
+                ok=False, raw_status=res.status, raw_body=res.body,
+                latency_ms=res.latency_ms, error="order_missing_rfq_id",
+                request_id=res.request_id,
+            )
+        return VarPlaceResult(
+            ok=True, raw_status=res.status, raw_body=res.body,
+            latency_ms=res.latency_ms, trade_id=rfq_id, request_id=res.request_id,
+        )
 
-        qty_str = format(qty, "f")
+    async def place_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
+        """Open a new position via /api/orders/new/market. Uses the poller's
+        latest quote_id — one HTTP call, no fallback."""
+        quote_id = self.get_quote_id() if self.get_quote_id is not None else None
+        if not quote_id:
+            return VarPlaceResult(ok=False, error="no_poller_quote_id")
+        return await self._submit_with_quote_id(
+            quote_id=quote_id, side=side, submit_url=VAR_NEW_MARKET_URL,
+            is_reduce_only=False, timeout_ms=timeout_ms,
+        )
+
+    async def place_close_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
+        """Reduce an existing position via /api/quotes/accept. Two-step —
+        close qty differs from the poller's qty, so no cached quote_id."""
+        import json as _json
         indicative_body = _json.dumps({
             "instrument": {
                 "underlying": asset,
@@ -213,7 +279,7 @@ class VariationalPlacerImpl:
                 "settlement_asset": VAR_SETTLEMENT_ASSET,
                 "instrument_type": VAR_INSTRUMENT_TYPE,
             },
-            "qty": qty_str,
+            "qty": format(qty, "f"),
         })
         quote_res = await self.cmd.execute_fetch(
             url=VAR_QUOTE_URL, method="POST",
@@ -231,62 +297,12 @@ class VariationalPlacerImpl:
             quote_parsed = _json.loads(quote_res.body or "{}")
         except Exception as exc:
             return VarPlaceResult(ok=False, error=f"quote_parse_failed: {exc}", raw_body=quote_res.body)
-        quote_id = quote_parsed.get("quote_id") if isinstance(quote_parsed, dict) else None
-        if not quote_id:
+        qid = quote_parsed.get("quote_id") if isinstance(quote_parsed, dict) else None
+        if not qid:
             return VarPlaceResult(ok=False, error="quote_missing_id", raw_body=quote_res.body)
-
-        order_body = _json.dumps({
-            "quote_id": quote_id,
-            "side": side,
-            "max_slippage": self.max_slippage,
-            "is_reduce_only": is_reduce_only,
-        })
-        order_res = await self.cmd.execute_fetch(
-            url=submit_url, method="POST",
-            headers={"content-type": "application/json"},
-            body=order_body, timeout_ms=timeout_ms,
-        )
-        if not order_res.ok or (order_res.status is not None and order_res.status >= 400):
-            return VarPlaceResult(
-                ok=False, raw_status=order_res.status, raw_body=order_res.body,
-                latency_ms=order_res.latency_ms,
-                error=order_res.error or f"order_http_{order_res.status}",
-                request_id=order_res.request_id,
-            )
-        rfq_id: str | None = None
-        try:
-            order_parsed = _json.loads(order_res.body or "{}")
-            if isinstance(order_parsed, dict):
-                raw_rfq = order_parsed.get("rfq_id")
-                rfq_id = str(raw_rfq) if raw_rfq else None
-        except Exception:
-            pass
-        if not rfq_id:
-            return VarPlaceResult(
-                ok=False, raw_status=order_res.status, raw_body=order_res.body,
-                latency_ms=order_res.latency_ms, error="order_missing_rfq_id",
-                request_id=order_res.request_id,
-            )
-        # trade_id is the correlation handle AutoTrader matches against fill
-        # events. Variational's /events WS reports fills with rfq_id, not the
-        # fill-level trade_id — see variational/listener.py._update_trade_event.
-        return VarPlaceResult(
-            ok=True, raw_status=order_res.status, raw_body=order_res.body,
-            latency_ms=order_res.latency_ms, trade_id=rfq_id, request_id=order_res.request_id,
-        )
-
-    async def place_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
-        """Open a new position via /api/orders/new/market (is_reduce_only: false)."""
-        return await self._rfq_then_submit(
-            side, qty, asset, timeout_ms,
-            submit_url=VAR_NEW_MARKET_URL, is_reduce_only=False,
-        )
-
-    async def place_close_order(self, side: str, qty: Decimal, asset: str, timeout_ms: int) -> VarPlaceResult:
-        """Reduce an existing position via /api/quotes/accept (is_reduce_only: true)."""
-        return await self._rfq_then_submit(
-            side, qty, asset, timeout_ms,
-            submit_url=VAR_QUOTE_ACCEPT_URL, is_reduce_only=True,
+        return await self._submit_with_quote_id(
+            quote_id=str(qid), side=side, submit_url=VAR_QUOTE_ACCEPT_URL,
+            is_reduce_only=True, timeout_ms=timeout_ms,
         )
 
     async def get_position(self, asset: str) -> Decimal | None:
@@ -434,10 +450,18 @@ class VariationalToLighterRuntime:
         self._trade_csv_write_lock = asyncio.Lock()
         self._trade_records_snapshot_sig: str | None = None
 
-        self.signal_engine = SignalEngine(strict=args.signal_strict)
+        self.signal_engine = SignalEngine()
+        # Event-driven signal evaluation: Lighter WS deltas and Var poll ticks
+        # both call evaluate_signal_now(); this lock serializes them.
+        self._signal_eval_lock = asyncio.Lock()
+        # Populated by var_poll_loop; read by VariationalPlacerImpl for the
+        # one-query open path and by the dashboard/signal for quote visibility.
+        # No TTL / no fallback — if poller hasn't populated this yet, orders
+        # simply fail and the breaker handles it.
+        self.latest_var_quote: dict[str, Any] | None = None
+        self.latest_var_quote_id: str | None = None
+        self.var_poll_task: asyncio.Task[None] | None = None
         self._asset_switch_lock = asyncio.Lock()
-        self._asset_switch_candidate: str | None = None
-        self._asset_switch_candidate_hits = 0
 
         self.trade_event_cursor = 0
 
@@ -780,6 +804,7 @@ class VariationalToLighterRuntime:
                                 self.lighter_snapshot_loaded = True
                                 self.lighter_order_book_ready = True
                                 self._refresh_lighter_best_locked()
+                            await self.evaluate_signal_now()
                             await self._trigger_close_on_book_tick()
 
                         elif msg_type == "update/order_book" and self.lighter_snapshot_loaded:
@@ -795,6 +820,7 @@ class VariationalToLighterRuntime:
                                     self.update_lighter_order_book("asks", order_book.get("asks", []))
                                     self.lighter_order_book_offset = new_offset
                                     self._refresh_lighter_best_locked()
+                            await self.evaluate_signal_now()
                             await self._trigger_close_on_book_tick()
 
                         elif msg_type == "update/account_orders":
@@ -929,27 +955,67 @@ class VariationalToLighterRuntime:
             rfq_id, trade_id, fill_px, fill_qty, side=side,
         )
 
+    async def var_poll_loop(self) -> None:
+        """Program-controlled Variational indicative poll. Runs once per
+        VAR_POLL_INTERVAL_SECONDS: POST /api/quotes/indicative at our exact
+        trade qty, write the response into VariationalMonitor (so dashboards
+        and signal consumers see it), cache the quote_id for the one-query
+        order path, then trigger signal evaluation.
+
+        No retry, no backoff, no fallback. If the cmd client isn't connected
+        or the fetch fails, we simply try again on the next tick; orders that
+        fire before we ever succeed will fail and the breaker will handle it.
+        """
+        import json as _json
+        while not self.stop_flag:
+            try:
+                await self._var_poll_once(_json)
+            except Exception:
+                self.logger.exception("var_poll_loop tick failed; continuing")
+            await asyncio.sleep(VAR_POLL_INTERVAL_SECONDS)
+
+    async def _var_poll_once(self, _json: Any) -> None:
+        asset = self.variational_ticker
+        qty = self.auto_trader_config.qty if self.auto_trader_config else None
+        if not asset or qty is None or qty <= 0 or self.cmd_client is None:
+            return
+        body = _json.dumps({
+            "instrument": {
+                "underlying": asset,
+                "funding_interval_s": VAR_FUNDING_INTERVAL_S,
+                "settlement_asset": VAR_SETTLEMENT_ASSET,
+                "instrument_type": VAR_INSTRUMENT_TYPE,
+            },
+            "qty": format(qty, "f"),
+        })
+        res = await self.cmd_client.execute_fetch(
+            url=VAR_QUOTE_URL, method="POST",
+            headers={"content-type": "application/json"},
+            body=body, timeout_ms=2000,
+        )
+        if not res.ok or not res.body:
+            return
+        try:
+            parsed = _json.loads(res.body)
+        except _json.JSONDecodeError:
+            return
+        if not isinstance(parsed, dict):
+            return
+        qid = parsed.get("quote_id")
+        if not qid:
+            return
+        self.latest_var_quote = parsed
+        self.latest_var_quote_id = str(qid)
+        async with self.runtime.monitor._lock:
+            self.runtime.monitor._update_quote(parsed)
+            self.runtime.monitor.last_update_at = utc_now()
+        await self.evaluate_signal_now()
+
     async def trade_loop(self) -> None:
         while not self.stop_flag:
             current_asset = await self.detect_current_variational_asset()
-            if current_asset:
-                if current_asset == self.variational_ticker:
-                    self._asset_switch_candidate = None
-                    self._asset_switch_candidate_hits = 0
-                else:
-                    if current_asset == self._asset_switch_candidate:
-                        self._asset_switch_candidate_hits += 1
-                    else:
-                        self._asset_switch_candidate = current_asset
-                        self._asset_switch_candidate_hits = 1
-
-                    if self._asset_switch_candidate_hits >= ASSET_SWITCH_CONFIRM_TICKS:
-                        await self.activate_asset(current_asset, reason="quote_stream_debounced")
-                        self._asset_switch_candidate = None
-                        self._asset_switch_candidate_hits = 0
-            else:
-                self._asset_switch_candidate = None
-                self._asset_switch_candidate_hits = 0
+            if current_asset and current_asset != self.variational_ticker:
+                await self.activate_asset(current_asset, reason="quote_stream_changed")
 
             events = await self.runtime.monitor.get_trade_events_since(self.trade_event_cursor, limit=500)
             for event in events:
@@ -1049,22 +1115,47 @@ class VariationalToLighterRuntime:
             }
         )
 
+    async def evaluate_signal_now(self) -> None:
+        """Event-driven signal evaluation.
+
+        Called from (a) var_poll_loop after each fresh indicative and (b) the
+        Lighter WS book handler after each best-bid/ask change. These are the
+        two MarketUpdate sources — together they drive the only signal path.
+        The dashboard used to re-run record/detect_edges on a 1Hz tick; that
+        delay is gone.
+        """
+        async with self._signal_eval_lock:
+            var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
+            lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+            state = self.signal_engine.record(
+                asset=quote_asset or self.variational_ticker,
+                var_bid=var_bid,
+                var_ask=var_ask,
+                lighter_bid=lighter_bid,
+                lighter_ask=lighter_ask,
+            )
+            for direction, event in self.signal_engine.detect_edges():
+                self._emit_signal_edge(direction, state, event=event)
+                if event == "signal_turned_green" and self.auto_trader is not None:
+                    asyncio.create_task(self.auto_trader.on_green_edge(direction, state))
+
     async def render_dashboard(self) -> Group:
         var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
 
-        state = self.signal_engine.record(
-            asset=quote_asset or self.variational_ticker,
-            var_bid=var_bid,
-            var_ask=var_ask,
-            lighter_bid=lighter_bid,
-            lighter_ask=lighter_ask,
-        )
-        # Edges consumed here so _prev_*_green advance; journaling/dispatch added in later tasks.
-        for direction, event in self.signal_engine.detect_edges():
-            self._emit_signal_edge(direction, state, event=event)
-            if event == "signal_turned_green" and self.auto_trader is not None:
-                asyncio.create_task(self.auto_trader.on_green_edge(direction, state))
+        # Read-only: signal eval runs event-driven via evaluate_signal_now().
+        # At startup, before the first MarketUpdate lands, state is None —
+        # fall back to a one-shot record so the dashboard can display
+        # something on first paint.
+        state = self.signal_engine.get_state()
+        if state is None:
+            state = self.signal_engine.record(
+                asset=quote_asset or self.variational_ticker,
+                var_bid=var_bid,
+                var_ask=var_ask,
+                lighter_bid=lighter_bid,
+                lighter_ask=lighter_ask,
+            )
 
         var_book_spread = spread_value(var_bid, var_ask)
         lighter_book_spread = spread_value(lighter_bid, lighter_ask)
@@ -1453,10 +1544,10 @@ class VariationalToLighterRuntime:
     async def run(self) -> None:
         self.logger.info(
             "Startup config: qty=%s throttle_s=%.1f max_trades/day=%d "
-            "signal_strict=%s leg_timeout_s=%.1f var_order_timeout_ms=%d lang=%s",
+            "leg_timeout_s=%.1f var_order_timeout_ms=%d lang=%s",
             self.auto_trader_config.qty, self.auto_trader_config.throttle_seconds,
             self.auto_trader_config.max_trades_per_day,
-            self.args.signal_strict, self.auto_trader_config.leg_settle_timeout_sec,
+            self.auto_trader_config.leg_settle_timeout_sec,
             self.auto_trader_config.var_order_timeout_ms, self.args.lang,
         )
         self.setup_signal_handlers()
@@ -1490,6 +1581,7 @@ class VariationalToLighterRuntime:
             self.cmd_client,
             max_slippage=self.args.var_max_slippage_bps / 10000.0,
             logger=self.logger,
+            get_quote_id=lambda: self.latest_var_quote_id,
         )
         lighter_adapter = LighterAdapterImpl(self)
         self.auto_trader = AutoTrader(
@@ -1517,6 +1609,7 @@ class VariationalToLighterRuntime:
         await self._capture_startup_account_snapshot(timeout=5.0)
 
         self.trade_task = asyncio.create_task(self.trade_loop())
+        self.var_poll_task = asyncio.create_task(self.var_poll_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
 
         while not self.stop_flag:
@@ -1532,6 +1625,10 @@ class VariationalToLighterRuntime:
         if self.trade_task and not self.trade_task.done():
             self.trade_task.cancel()
             await asyncio.gather(self.trade_task, return_exceptions=True)
+
+        if self.var_poll_task and not self.var_poll_task.done():
+            self.var_poll_task.cancel()
+            await asyncio.gather(self.var_poll_task, return_exceptions=True)
 
         if self.lighter_ws_task and not self.lighter_ws_task.done():
             self.lighter_ws_task.cancel()
@@ -1565,8 +1662,6 @@ def parse_args() -> argparse.Namespace:
                         help="Per-venue position ceiling (unsigned qty). At |pos|>=limit "
                              "on either venue we enter reduce-only mode and stay there "
                              "until BOTH venues are flat. 0 means auto-derive as 2x qty.")
-    parser.add_argument("--signal-strict", action="store_true",
-                        help="Require adjusted > max(5m,30m,1h) instead of any().")
     parser.add_argument("--var-order-timeout-ms", type=int, default=5000)
     parser.add_argument("--leg-settle-timeout-sec", type=float, default=10.0)
     parser.add_argument("--debug-var-payload", action="store_true",
