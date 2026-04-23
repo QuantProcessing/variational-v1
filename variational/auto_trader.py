@@ -1,9 +1,16 @@
-"""AutoTrader: signal-driven cross-venue trade orchestration.
+"""AutoTrader: premium-band cross-venue strategy.
 
-Each green-edge event from SignalEngine becomes a TradeCycle: two legs
-(Variational via CmdClient, Lighter via SignerClient) fire in parallel.
-Fills stream back asynchronously. At settlement, the cycle computes
-realized vs expected P&L attribution and writes one line to cycle_pnl.
+One-sided mean-reversion on the Var-premium vs Lighter:
+
+    premium_bp = (var_bid - lighter_ask) / lighter_ask * 1e4
+
+State machine (per MarketUpdate tick):
+    flat + premium > open_bp         -> open short-var / long-lighter cycle
+    in_position + premium < close_bp -> close both legs
+
+Round-trip PnL ≈ entry_premium_bp - exit_premium_bp - slippage_roundtrip,
+so (open_bp - close_bp) is the target edge per cycle. No median, no edges,
+no stop-loss, no timeout — the bet is that Var/Lighter premiums revert.
 """
 
 from __future__ import annotations
@@ -15,10 +22,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Optional
+from typing import Any
 
 from variational.journal import EventJournal
-from variational.signal import SignalEngine, SignalState
+from variational.signal import MarketState
 
 # Fraction of Lighter top-of-book qty to consume per close attempt. Leaving
 # 70% on the book means competitors eating the level ahead of us only eats
@@ -57,9 +64,14 @@ def _dec_str(value: Decimal | None) -> str | None:
 @dataclass(slots=True)
 class AutoTraderConfig:
     qty: Decimal
-    throttle_seconds: float = 3.0
+    # Premium band thresholds, in basis points.
+    # open_bp  : fire a new cycle when premium strictly exceeds this.
+    # close_bp : unwind the current cycle when premium drops below this.
+    # Target per-cycle edge (before slippage) = open_bp - close_bp.
+    open_bp: float = 8.0
+    close_bp: float = 1.0
+    throttle_seconds: float = 1.0
     max_trades_per_day: int = 200
-    position_limit: Decimal = Decimal("0")
     leg_settle_timeout_sec: float = 10.0
     var_order_timeout_ms: int = 5000
     hedge_slippage_bps: float = 100.0
@@ -110,11 +122,12 @@ class LighterLegState(LegState):
 @dataclass(slots=True)
 class TradeCycle:
     cycle_id: str
-    direction: str
     asset: str
     opened_at: str
+    # Premium (bp) at the moment we decided to open. Entry_premium_bp in
+    # the PnL formula. Always short_var_long_lighter; no direction field.
+    entry_premium_bp: float | None = None
     closed_at: str | None = None
-    signal_snapshot: SignalState | None = None
     plan: TradePlan | None = None
     var_leg: VarLegState = field(default_factory=VarLegState)
     lighter_leg: LighterLegState = field(default_factory=LighterLegState)
@@ -219,7 +232,6 @@ class AutoTrader:
     def __init__(
         self,
         *,
-        signal: SignalEngine,
         var_placer: VariationalPlacer,
         lighter: LighterAdapter,
         config: AutoTraderConfig,
@@ -227,7 +239,6 @@ class AutoTrader:
         cycles_journal: EventJournal,
         logger: logging.Logger,
     ) -> None:
-        self.signal = signal
         self.var_placer = var_placer
         self.lighter = lighter
         self.config = config
@@ -236,7 +247,7 @@ class AutoTrader:
         self.logger = logger
 
         self.stats = TraderStats(_day_key=_today_key())
-        self._last_fire_monotonic: dict[str, float] = {}
+        self._last_fire_monotonic: float = 0.0
         self._open_cycles: dict[str, TradeCycle] = {}
         self._lighter_order_to_cycle: dict[int, str] = {}
         self._lock = asyncio.Lock()
@@ -248,18 +259,12 @@ class AutoTrader:
         # so stale entries (close-order fills, failed cycles) can be GC'd.
         self._pending_var_fills: dict[str, list[tuple[Decimal, Decimal, str | None, float]]] = {}
 
-        # Recent cycles (open + closed) for dashboard/CSV rendering. Kept as a
-        # deque with bounded length so the dashboard can iterate newest-first
-        # without querying _open_cycles (opens show here while in-flight and
-        # remain after settlement).
+        # Recent cycles (open + closed) for dashboard/CSV rendering.
         self._recent_cycles: deque[TradeCycle] = deque(maxlen=500)
 
-        # Hysteresis: once |net_qty| reaches position_limit we enter close mode
-        # (signal fires paused; WS ticks drive active reduce-only closes when
-        # close PnL >= 0). Exit close mode only when BOTH venues are fully
-        # flat — resuming while still carrying inventory just cycles back up
-        # to the limit and pays the open→close slippage round-trip again.
-        self._close_mode = False
+        # In-progress guards: only ONE cycle at a time (max 1 concurrent
+        # position), and closing is serialised so two MarketUpdates in quick
+        # succession don't double-fire the unwind.
         self._close_in_progress = False
 
         # Per-venue position accounting for close PnL computation.
@@ -269,97 +274,51 @@ class AutoTrader:
         self._lighter_pos_qty: Decimal = Decimal("0")
         self._lighter_pos_avg: Decimal = Decimal("0")
 
-        if self.config.position_limit == 0:
-            self.config.position_limit = self.config.qty * Decimal("2")
-
     # ---------- public API ----------
 
-    async def on_green_edge(self, direction: str, state: SignalState) -> None:
-        reason = self._gate_check(direction, state)
-        if reason is not None:
-            self.events.emit({
-                "ts": _utc_now_iso(),
-                "event": "signal_decision",
-                "direction": direction,
-                "decision": "skip",
-                "reason": reason,
-            })
+    async def on_market_update(self, state: MarketState) -> None:
+        """Single entry point driven by every MarketUpdate (Lighter WS book
+        delta or Var indicative poll). Decides whether to open or close
+        based on current premium and position state."""
+        if state.premium_bp is None:
             return
-        await self._fire(direction, state)
+        self._maybe_rollover()
+        if self.stats.frozen:
+            return
+
+        flat = self._is_flat()
+        if flat:
+            if state.premium_bp > self.config.open_bp:
+                await self._try_open(state)
+        else:
+            if state.premium_bp < self.config.close_bp:
+                await self._try_close(state)
 
     def snapshot(self) -> TraderStats:
         self._maybe_rollover()
         return self.stats
 
-    # ---------- gates ----------
+    # ---------- state predicates ----------
 
-    def _gate_check(self, direction: str, state: SignalState) -> str | None:
-        self._maybe_rollover()
-        if self.stats.frozen:
-            return "frozen"
-        last = self._last_fire_monotonic.get(direction)
+    def _is_flat(self) -> bool:
+        """Truly flat: no in-flight open cycle AND no filled position on
+        either venue AND no close already in progress. Conservative on
+        purpose — avoids double-firing near fill boundaries."""
+        if self._open_cycles:
+            return False
+        if self._close_in_progress:
+            return False
+        if abs(self._var_pos_qty) > QTY_QUANTUM:
+            return False
+        if abs(self._lighter_pos_qty) > QTY_QUANTUM:
+            return False
+        return True
+
+    def _throttled(self) -> bool:
         import time
-        now_mono = time.monotonic()
-        if last is not None and (now_mono - last) < self.config.throttle_seconds:
-            return "throttled"
-        if self.stats.trades_today >= self.config.max_trades_per_day:
-            return "day_limit"
-
-        ds = state.long_direction if direction == "long_var_short_lighter" else state.short_direction
-        if ds.adjusted_pct is None or float(ds.adjusted_pct) <= 0:
-            return "signal_flipped"
-
-        # Position-limit hysteresis:
-        # - normal mode: reject if projected |net| would exceed position_limit
-        # - close mode: reject ALL signal fires (closes happen via WS-driven
-        #   try_close_on_book_tick, not via the signal).
-        if self._close_mode:
-            return "close_mode"
-        signed = self.config.qty if direction == "long_var_short_lighter" else -self.config.qty
-        projected = self._projected_net_qty() + signed
-        if abs(projected) > self.config.position_limit:
-            return "position_limit_exceeded"
-        return None
-
-    def _projected_net_qty(self) -> Decimal:
-        """Net signed exposure including in-flight cycles.
-
-        = filled var position + unfilled remainder of open cycles' var legs,
-        signed by direction. No separate accumulator; derived on demand.
-        """
-        net = self._var_pos_qty
-        for c in self._open_cycles.values():
-            remaining = c.var_leg.requested_qty - c.var_leg.filled_qty
-            if remaining <= 0:
-                continue
-            net += remaining if c.direction == "long_var_short_lighter" else -remaining
-        return net
-
-    def _update_mode(self) -> None:
-        """Recompute close-mode state from actual filled venue positions.
-
-        Enter at |pos| >= limit; exit only when BOTH venues are flat
-        (<= QTY_QUANTUM to ignore dust). Flat-only exit prevents the
-        open→close oscillation where we close halfway, re-fire, and pay
-        the round-trip slippage repeatedly.
-        """
-        abs_net = max(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
-        limit = self.config.position_limit
-        if not self._close_mode and abs_net >= limit:
-            self._close_mode = True
-            self.logger.warning(
-                "Entering close mode: var_pos=%s lighter_pos=%s limit=%s. "
-                "Signal fires paused; WS ticks drive reduce-only closes "
-                "when close_pnl >= 0 until BOTH venues are flat.",
-                self._var_pos_qty, self._lighter_pos_qty, limit,
-            )
-        elif self._close_mode and abs_net <= QTY_QUANTUM:
-            self._close_mode = False
-            self.logger.info(
-                "Exiting close mode: var_pos=%s lighter_pos=%s. "
-                "Position flat; resuming normal cycle dispatch.",
-                self._var_pos_qty, self._lighter_pos_qty,
-            )
+        if self.config.throttle_seconds <= 0:
+            return False
+        return (time.monotonic() - self._last_fire_monotonic) < self.config.throttle_seconds
 
     def _maybe_rollover(self) -> None:
         today = _today_key()
@@ -367,46 +326,49 @@ class AutoTrader:
             self.stats._day_key = today
             self.stats.trades_today = 0
             self.stats.failures_today = 0
-            # Consecutive failures / frozen do NOT reset on day rollover — user must restart.
+            # Consecutive failures / frozen do NOT reset on day rollover.
 
-    # ---------- fire ----------
+    # ---------- open ----------
 
-    async def _fire(self, direction: str, state: SignalState) -> None:
+    async def _try_open(self, state: MarketState) -> None:
+        if self._throttled():
+            return
+        if self.stats.trades_today >= self.config.max_trades_per_day:
+            return
+        # Depth sanity: lighter_ask_qty tells us the top-of-book absorb
+        # capacity. If we'd eat through the top level, skip — slippage on
+        # the long-lighter leg would likely kill the edge.
+        need_qty = self.config.qty
+        if state.lighter_ask_qty is not None and state.lighter_ask_qty < need_qty:
+            return
+        await self._fire_open(state)
+
+    async def _fire_open(self, state: MarketState) -> None:
         import time
         cycle_id = _new_cycle_id()
         now_iso = _utc_now_iso()
         now_mono = time.monotonic()
 
-        ds = state.long_direction if direction == "long_var_short_lighter" else state.short_direction
-        if direction == "long_var_short_lighter":
-            expected_var_fill = state.var_ask
-            expected_lighter_fill = state.lighter_bid
-            var_side = "buy"
-            lighter_side = "SELL"
-        else:
-            expected_var_fill = state.var_bid
-            expected_lighter_fill = state.lighter_ask
-            var_side = "sell"
-            lighter_side = "BUY"
-
-        expected_net_pct = float(ds.cross_spread_pct) if ds.cross_spread_pct is not None else None
+        # Strategy is one-sided: short Var @ var_bid, long Lighter @ lighter_ask.
+        expected_var_fill = state.var_bid
+        expected_lighter_fill = state.lighter_ask
+        var_side = "sell"
+        lighter_side = "BUY"
 
         plan = TradePlan(
             qty_target=self.config.qty,
             expected_var_fill_px=expected_var_fill,
             expected_lighter_fill_px=expected_lighter_fill,
-            expected_net_pct=expected_net_pct,
+            expected_net_pct=(state.premium_bp / 100.0) if state.premium_bp is not None else None,
         )
 
         cycle = TradeCycle(
             cycle_id=cycle_id,
-            direction=direction,
             asset=state.asset or "UNKNOWN",
             opened_at=now_iso,
-            signal_snapshot=state,
+            entry_premium_bp=state.premium_bp,
             plan=plan,
         )
-        # Quantize to 2dp so both venues get the identical qty string.
         open_qty = quantize_qty(self.config.qty)
         cycle.var_leg.requested_qty = open_qty
         cycle.lighter_leg.requested_qty = open_qty
@@ -414,18 +376,18 @@ class AutoTrader:
         async with self._lock:
             self._open_cycles[cycle_id] = cycle
             self._recent_cycles.appendleft(cycle)
-            self._last_fire_monotonic[direction] = now_mono
+            self._last_fire_monotonic = now_mono
             self.stats.trades_today += 1
-            self._update_mode()
 
         self.events.emit({
             "ts": now_iso, "event": "cycle_opened", "cycle_id": cycle_id,
-            "direction": direction, "asset": cycle.asset,
+            "asset": cycle.asset,
+            "entry_premium_bp": state.premium_bp,
             "qty_target": _dec_str(self.config.qty),
             "plan": {
                 "expected_var_fill_px": _dec_str(expected_var_fill),
                 "expected_lighter_fill_px": _dec_str(expected_lighter_fill),
-                "expected_net_pct": expected_net_pct,
+                "expected_net_pct": plan.expected_net_pct,
             },
         })
 
@@ -627,8 +589,6 @@ class AutoTrader:
             signed = fill_qty if side.lower() == "buy" else -fill_qty
             self._update_venue_position("var", signed, fill_px)
             self.stats.var_volume_usd += fill_px * fill_qty
-            async with self._lock:
-                self._update_mode()
 
         if not rfq_id:
             return  # close order without correlation — position updated above
@@ -667,8 +627,6 @@ class AutoTrader:
             signed = fill_qty if side.upper() == "BUY" else -fill_qty
             self._update_venue_position("lighter", signed, fill_px)
             self.stats.lighter_volume_usd += fill_px * fill_qty
-            async with self._lock:
-                self._update_mode()
         async with self._lock:
             cycle_id = self._lighter_order_to_cycle.get(client_order_id)
             cycle = self._open_cycles.get(cycle_id) if cycle_id else None
@@ -700,100 +658,69 @@ class AutoTrader:
         else:
             self._lighter_pos_qty, self._lighter_pos_avg = new_qty, new_avg
 
-    # ---------- WS-driven active close (close mode) ----------
+    # ---------- close ----------
 
-    async def try_close_on_book_tick(
-        self,
-        asset: str,
-        var_bid: Decimal | None, var_ask: Decimal | None,
-        lighter_bid: Decimal | None, lighter_ask: Decimal | None,
-        lighter_bid_qty: Decimal | None, lighter_ask_qty: Decimal | None,
-    ) -> None:
-        """Called on every Lighter order-book WS update. If we're in close
-        mode AND closing now at taker prices would yield non-negative PnL
-        AND Lighter has book depth to execute, fire a reduce-only close on
-        both venues sized to the Lighter top book qty (or remaining net,
-        whichever is smaller).
-        """
-        if not self._close_mode or self._close_in_progress:
+    async def _try_close(self, state: MarketState) -> None:
+        """Fire reduce-only unwind on both venues. Gate = premium < close_bp
+        (checked by caller) + Lighter depth + no close already in flight.
+        Position is always short_var / long_lighter under the one-sided
+        strategy, but we handle the opposite case too in the rare event of
+        venue drift synced via _verify_positions_after_cycle."""
+        if self._close_in_progress:
             return
-        if var_bid is None or var_ask is None or lighter_bid is None or lighter_ask is None:
+        if state.var_bid is None or state.var_ask is None:
             return
-        # If one side is 0, paired close is impossible. Kick off a residual
-        # handler that queries actual positions from both venues and fires a
-        # single-venue reduce-only close on whichever side still has inventory.
-        # Exception: if the remaining residual is below the venue's min order
-        # size (RESIDUAL_DUST_QTY), Lighter rejects every close attempt with
-        # code=21706 and we'd spin here forever. Give up, exit close_mode,
-        # let signal fires resume. User cleans the dust manually.
+        if state.lighter_bid is None or state.lighter_ask is None:
+            return
+
+        # Venue drift: if one side shows zero while the other is non-zero,
+        # the paired close can't work; spin off a single-venue residual close.
+        # Below-dust residuals are abandoned (Lighter rejects sub-min orders
+        # with code=21706) — user cleans up on the venue UI.
         if self._var_pos_qty == 0 or self._lighter_pos_qty == 0:
             residual = abs(self._var_pos_qty) + abs(self._lighter_pos_qty)
             if residual < RESIDUAL_DUST_QTY:
-                async with self._lock:
-                    if self._close_mode:
-                        self._close_mode = False
-                        self.logger.warning(
-                            "Residual var=%s lighter=%s below dust threshold %s; "
-                            "exiting close_mode. Close manually on the venue UI.",
-                            self._var_pos_qty, self._lighter_pos_qty, RESIDUAL_DUST_QTY,
-                        )
+                self.logger.warning(
+                    "Residual var=%s lighter=%s below dust threshold %s; "
+                    "abandoning. Clean manually on the venue UI.",
+                    self._var_pos_qty, self._lighter_pos_qty, RESIDUAL_DUST_QTY,
+                )
+                # Zero out so _is_flat() lets new opens resume.
+                self._var_pos_qty = Decimal("0")
+                self._lighter_pos_qty = Decimal("0")
                 return
-            if not self._close_in_progress:
-                self._close_in_progress = True
-                asyncio.create_task(self._handle_close_mode_residual(asset))
+            self._close_in_progress = True
+            asset = state.asset or ""
+            asyncio.create_task(self._handle_residual(asset))
             return
         if self._var_pos_avg == 0 or self._lighter_pos_avg == 0:
             return
 
-        if self._var_pos_qty > 0:
-            # Long Var, short Lighter. Close = SELL var @ var_bid + BUY lighter @ lighter_ask.
-            # To "close" this is equivalent to firing the short_var_long_lighter
-            # direction signal — so we gate on that direction's is_green.
-            pnl_per_unit = (var_bid - self._var_pos_avg) + (self._lighter_pos_avg - lighter_ask)
-            top_qty = lighter_ask_qty
-            var_side, lighter_side = "sell", "BUY"
-            closable = min(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
-            reverse_is_green_dir = "short_var_long_lighter"
-        else:
-            # Short Var, long Lighter. Close = BUY var @ var_ask + SELL lighter @ lighter_bid.
-            # Closing this mirrors firing long_var_short_lighter direction.
-            pnl_per_unit = (self._var_pos_avg - var_ask) + (lighter_bid - self._lighter_pos_avg)
-            top_qty = lighter_bid_qty
+        # Normal case: short Var / long Lighter → BUY var @ ask, SELL lighter @ bid.
+        # Defensive else branch handles the drift-flipped scenario.
+        if self._var_pos_qty < 0:
+            top_qty = state.lighter_bid_qty
             var_side, lighter_side = "buy", "SELL"
-            closable = min(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
-            reverse_is_green_dir = "long_var_short_lighter"
-
-        # Use the SignalEngine's reverse-direction green as the primary gate:
-        # only close when the cross-spread relative to its own recent history
-        # is favorable (adjusted > median_5m/30m/1h). This filters out
-        # "just-crossed-zero" noisy moments that eat pnl via execution slippage.
-        state = self.signal.get_state()
-        if state is None:
-            return
-        reverse_state = (
-            state.short_direction if reverse_is_green_dir == "short_var_long_lighter"
-            else state.long_direction
-        )
-        if not reverse_state.is_green:
+        else:
+            top_qty = state.lighter_ask_qty
+            var_side, lighter_side = "sell", "BUY"
+        closable = min(abs(self._var_pos_qty), abs(self._lighter_pos_qty))
+        if top_qty is None or top_qty <= 0:
             return
 
-        if pnl_per_unit < 0 or top_qty is None or top_qty <= 0:
-            return
-
-        # Only consume 30% of Lighter top-of-book qty per attempt — competitors
-        # snapping up the level can eat ~70% without pushing us to worse levels.
-        # Successive WS ticks re-fire until position is drained.
-        # Quantize to 2dp so Var RFQ and Lighter limit get the identical qty.
+        # Consume only 30% of Lighter top-of-book qty per attempt so
+        # competitors eating the level don't push us to worse prints.
+        # Successive MarketUpdates re-fire until position drains.
         close_qty = quantize_qty(min(closable, top_qty * CLOSE_BOOK_FRACTION))
         if close_qty <= 0:
             return
 
         self._close_in_progress = True
         asyncio.create_task(self._execute_close(
-            asset=asset, qty=close_qty,
+            asset=state.asset or "", qty=close_qty,
             var_side=var_side, lighter_side=lighter_side,
-            lighter_bid=lighter_bid, lighter_ask=lighter_ask,
-            est_pnl_per_unit=pnl_per_unit,
+            lighter_bid=state.lighter_bid, lighter_ask=state.lighter_ask,
+            exit_premium_bp=state.premium_bp,
         ))
 
     async def _execute_close(
@@ -801,14 +728,14 @@ class AutoTrader:
         asset: str, qty: Decimal,
         var_side: str, lighter_side: str,
         lighter_bid: Decimal, lighter_ask: Decimal,
-        est_pnl_per_unit: Decimal,
+        exit_premium_bp: float | None,
     ) -> None:
         t0_iso = _utc_now_iso()
         self.events.emit({
             "ts": t0_iso, "event": "close_attempt",
             "asset": asset, "qty": _dec_str(qty),
             "var_side": var_side, "lighter_side": lighter_side,
-            "est_pnl_per_unit": _dec_str(est_pnl_per_unit),
+            "exit_premium_bp": exit_premium_bp,
             "var_pos_before": _dec_str(self._var_pos_qty),
             "lighter_pos_before": _dec_str(self._lighter_pos_qty),
         })
@@ -850,7 +777,6 @@ class AutoTrader:
                 "lighter_ok": lig_ok, "lighter_error": lig_error,
                 "var_pos_after": _dec_str(self._var_pos_qty),
                 "lighter_pos_after": _dec_str(self._lighter_pos_qty),
-                "close_mode_after": self._close_mode,
             })
         except Exception as exc:
             self.events.emit({
@@ -860,10 +786,10 @@ class AutoTrader:
         finally:
             self._close_in_progress = False
 
-    async def _handle_close_mode_residual(self, asset: str) -> None:
-        """Called when close_mode sees one venue at 0. Queries actual positions
-        from both venues and fires a single-venue reduce-only close on whichever
-        side still has inventory. Syncs tracker to match reality afterward."""
+    async def _handle_residual(self, asset: str) -> None:
+        """Called when _try_close sees one venue at 0 but the other non-zero.
+        Queries actual positions and fires a single-venue reduce-only close
+        on the side that still has inventory. Syncs tracker to reality."""
         try:
             var_actual = await self.var_placer.get_position(asset)
             lig_actual = await self.lighter.get_position(asset)
@@ -887,21 +813,15 @@ class AutoTrader:
             lig_abs = abs(lig_actual)
 
             if var_abs == 0 and lig_abs == 0:
-                # Both flat — just exit close_mode via _update_mode re-check
-                async with self._lock:
-                    self._update_mode()
+                # Both flat — nothing to do; _is_flat() will let new opens resume.
                 return
 
-            # Fire single-venue close on the heavier / non-zero side
+            # Fire single-venue close on the non-zero side
             if var_abs > 0 and lig_abs == 0:
                 await self._close_var_residual(asset, var_actual)
             elif lig_abs > 0 and var_abs == 0:
                 await self._close_lighter_residual(asset, lig_actual)
-            else:
-                # Both non-zero but tracker showed one as 0 — drift case.
-                # Let normal paired close resume next tick now that tracker synced.
-                async with self._lock:
-                    self._update_mode()
+            # Both non-zero — tracker drifted, normal paired close resumes next tick.
         finally:
             self._close_in_progress = False
 
@@ -991,7 +911,6 @@ class AutoTrader:
             self._var_pos_avg = Decimal("0")
             self._lighter_pos_qty = Decimal("0")
             self._lighter_pos_avg = Decimal("0")
-            self._close_mode = False
             self._close_in_progress = False
 
     def _apply_var_fill(self, cycle: TradeCycle, fill_px: Decimal, fill_qty: Decimal) -> None:
@@ -1060,7 +979,6 @@ class AutoTrader:
             self._open_cycles.pop(cycle.cycle_id, None)
             if cycle.lighter_leg.client_order_id is not None:
                 self._lighter_order_to_cycle.pop(cycle.lighter_leg.client_order_id, None)
-            self._update_mode()
 
         attribution = self._compute_attribution(cycle)
         cycles_row = self._cycle_to_row(cycle, attribution)
@@ -1114,9 +1032,7 @@ class AutoTrader:
             )
             self._lighter_pos_qty = lig_actual
             synced = True
-        if synced:
-            async with self._lock:
-                self._update_mode()
+        _ = synced  # unused after mode removal; kept for future hook
 
     def _compute_attribution(self, cycle: TradeCycle) -> dict[str, Any]:
         plan = cycle.plan or TradePlan(
@@ -1132,21 +1048,19 @@ class AutoTrader:
         var_slip_pct: float | None = None
         lig_slip_pct: float | None = None
 
-        if cycle.direction == "long_var_short_lighter" and var_avg is not None and lig_avg is not None and var_avg != 0:
-            realized_net_pct = float((lig_avg - var_avg) / var_avg) * 100.0
-        elif cycle.direction == "short_var_long_lighter" and var_avg is not None and lig_avg is not None and lig_avg != 0:
+        # Single direction: short Var / long Lighter.
+        # realized_net_pct is the OPEN-leg paper edge vs Lighter's basis. True
+        # round-trip PnL lives in close_attempt / close_ack events and is NOT
+        # aggregated into this field (a known gap; see roadmap).
+        if var_avg is not None and lig_avg is not None and lig_avg != 0:
             realized_net_pct = float((var_avg - lig_avg) / lig_avg) * 100.0
 
         if plan.expected_var_fill_px is not None and var_avg is not None and plan.expected_var_fill_px != 0:
-            if cycle.direction == "long_var_short_lighter":
-                var_slip_pct = float((var_avg - plan.expected_var_fill_px) / plan.expected_var_fill_px) * 100.0
-            else:
-                var_slip_pct = float((plan.expected_var_fill_px - var_avg) / plan.expected_var_fill_px) * 100.0
+            # Sell-side slippage: expected bid - actual avg (positive = worse than quoted).
+            var_slip_pct = float((plan.expected_var_fill_px - var_avg) / plan.expected_var_fill_px) * 100.0
         if plan.expected_lighter_fill_px is not None and lig_avg is not None and plan.expected_lighter_fill_px != 0:
-            if cycle.direction == "long_var_short_lighter":
-                lig_slip_pct = float((plan.expected_lighter_fill_px - lig_avg) / plan.expected_lighter_fill_px) * 100.0
-            else:
-                lig_slip_pct = float((lig_avg - plan.expected_lighter_fill_px) / plan.expected_lighter_fill_px) * 100.0
+            # Buy-side slippage: actual avg - expected ask (positive = worse than quoted).
+            lig_slip_pct = float((lig_avg - plan.expected_lighter_fill_px) / plan.expected_lighter_fill_px) * 100.0
 
         qty_t = cycle.var_leg.requested_qty
         fill_ratio = min(
@@ -1170,8 +1084,7 @@ class AutoTrader:
         }
 
     def _cycle_to_row(self, cycle: TradeCycle, attribution: dict[str, Any]) -> dict[str, Any]:
-        s = cycle.signal_snapshot
-        plan = cycle.plan or TradePlan(cycle.var_leg.requested_qty, None, None, None, None)
+        plan = cycle.plan or TradePlan(cycle.var_leg.requested_qty, None, None, None)
         duration_ms = None
         if cycle.opened_at and cycle.closed_at:
             try:
@@ -1180,34 +1093,14 @@ class AutoTrader:
                 duration_ms = int((t1 - t0).total_seconds() * 1000)
             except Exception:
                 duration_ms = None
-        if s is not None:
-            direction_state = s.long_direction if cycle.direction == "long_var_short_lighter" else s.short_direction
-            signal_block = {
-                "adjusted_pct": _dec_str(direction_state.adjusted_pct),
-                "baseline_pct": _dec_str(s.book_spread_baseline_pct),
-                "median_5m_pct": direction_state.median_5m_pct,
-                "median_30m_pct": direction_state.median_30m_pct,
-                "median_1h_pct": direction_state.median_1h_pct,
-                "var_bid": _dec_str(s.var_bid),
-                "var_ask": _dec_str(s.var_ask),
-                "lighter_bid": _dec_str(s.lighter_bid),
-                "lighter_ask": _dec_str(s.lighter_ask),
-            }
-        else:
-            signal_block = {
-                "adjusted_pct": None, "baseline_pct": None,
-                "median_5m_pct": None, "median_30m_pct": None, "median_1h_pct": None,
-                "var_bid": None, "var_ask": None, "lighter_bid": None, "lighter_ask": None,
-            }
         return {
             "cycle_id": cycle.cycle_id,
             "triggered_at": cycle.opened_at,
             "closed_at": cycle.closed_at,
             "duration_ms": duration_ms,
             "asset": cycle.asset,
-            "direction": cycle.direction,
+            "entry_premium_bp": cycle.entry_premium_bp,
             "status": cycle.status,
-            "signal": signal_block,
             "plan": {
                 "qty_target": _dec_str(plan.qty_target),
                 "expected_var_fill_px": _dec_str(plan.expected_var_fill_px),

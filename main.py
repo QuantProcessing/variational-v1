@@ -35,7 +35,7 @@ from variational.listener import (
     run_command_server,
     run_receiver_server,
 )
-from variational.signal import SignalEngine
+from variational.signal import MarketState, build_market_state
 
 VARIATIONAL_TICKER_OVERRIDES = {
     "LIT": "LIGHTER",
@@ -68,6 +68,10 @@ DASHBOARD_ORDERS = 8
 # How often we actively POST /api/quotes/indicative at our trade qty. This is
 # the Var-side MarketUpdate rate; every successful poll triggers signal eval.
 VAR_POLL_INTERVAL_SECONDS = 1.0
+# Minimum gap between market_tick log writes. Lighter WS can deliver deltas
+# at > 10 Hz; without a throttle the log explodes. Strategy decisions still
+# run at full rate — only logging is throttled.
+MARKET_TICK_LOG_MIN_INTERVAL_SECONDS = 0.5
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
 LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
@@ -441,8 +445,10 @@ class VariationalToLighterRuntime:
         )
 
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
-        self.signal_events_file = output_dir / "signal_events.jsonl" if output_dir else LOG_DIR / "signal_events.jsonl"
-        self.signal_journal = EventJournal(self.signal_events_file)
+        self.market_ticks_file = (
+            output_dir / "market_ticks.jsonl" if output_dir else LOG_DIR / "market_ticks.jsonl"
+        )
+        self.market_ticks_journal = EventJournal(self.market_ticks_file)
         self.events_journal = EventJournal(LOG_DIR / "order_events.jsonl")
         self.cycles_journal = EventJournal(LOG_DIR / "cycle_pnl.jsonl")
         self.auto_trader: AutoTrader | None = None
@@ -450,10 +456,16 @@ class VariationalToLighterRuntime:
         self._trade_csv_write_lock = asyncio.Lock()
         self._trade_records_snapshot_sig: str | None = None
 
-        self.signal_engine = SignalEngine()
-        # Event-driven signal evaluation: Lighter WS deltas and Var poll ticks
-        # both call evaluate_signal_now(); this lock serializes them.
-        self._signal_eval_lock = asyncio.Lock()
+        # Latest MarketState built by on_market_update. Read by dashboard
+        # and used for market_ticks logging. None until the first tick lands.
+        self.latest_market_state: MarketState | None = None
+        # Event-driven strategy evaluation: Lighter WS deltas and Var poll ticks
+        # both call on_market_update(); this lock serializes them so two
+        # ticks don't race on AutoTrader's open/close predicates.
+        self._market_update_lock = asyncio.Lock()
+        # Throttle market_ticks logging to this interval (seconds). Ticks
+        # above this rate still drive strategy decisions but don't all write.
+        self._last_market_tick_log_mono: float = 0.0
         # Populated by var_poll_loop; read by VariationalPlacerImpl for the
         # one-query open path and by the dashboard/signal for quote visibility.
         # No TTL / no fallback — if poller hasn't populated this yet, orders
@@ -501,12 +513,12 @@ class VariationalToLighterRuntime:
         self.dashboard_task: asyncio.Task[None] | None = None
 
         qty_dec = Decimal(args.qty)
-        position_limit_dec = Decimal(args.position_limit)
         self.auto_trader_config = AutoTraderConfig(
             qty=qty_dec,
+            open_bp=args.open_bp,
+            close_bp=args.close_bp,
             throttle_seconds=args.throttle_seconds,
             max_trades_per_day=args.max_trades_per_day,
-            position_limit=position_limit_dec,
             leg_settle_timeout_sec=args.leg_settle_timeout_sec,
             var_order_timeout_ms=args.var_order_timeout_ms,
         )
@@ -595,7 +607,7 @@ class VariationalToLighterRuntime:
     async def _reset_state_for_asset_switch(self) -> None:
         if self.auto_trader is not None:
             await self.auto_trader.reset_for_asset_switch()
-        self.signal_engine.reset()
+        self.latest_market_state = None
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -703,25 +715,6 @@ class VariationalToLighterRuntime:
             self.lighter_best_ask = None
             self.lighter_best_ask_qty = None
 
-    async def _trigger_close_on_book_tick(self) -> None:
-        """After a Lighter book update, give AutoTrader a chance to fire a
-        WS-driven reduce-only close. Uses cached Variational quote as an
-        estimate; the actual close path requests a fresh RFQ."""
-        if self.auto_trader is None:
-            return
-        var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
-        async with self.lighter_order_book_lock:
-            lb = self.lighter_best_bid
-            la = self.lighter_best_ask
-            lbq = self.lighter_best_bid_qty
-            laq = self.lighter_best_ask_qty
-        await self.auto_trader.try_close_on_book_tick(
-            asset=self.variational_ticker or "",
-            var_bid=var_bid, var_ask=var_ask,
-            lighter_bid=lb, lighter_ask=la,
-            lighter_bid_qty=lbq, lighter_ask_qty=laq,
-        )
-
     async def request_fresh_snapshot(self, ws: Any) -> None:
         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
@@ -804,8 +797,7 @@ class VariationalToLighterRuntime:
                                 self.lighter_snapshot_loaded = True
                                 self.lighter_order_book_ready = True
                                 self._refresh_lighter_best_locked()
-                            await self.evaluate_signal_now()
-                            await self._trigger_close_on_book_tick()
+                            await self.on_market_update()
 
                         elif msg_type == "update/order_book" and self.lighter_snapshot_loaded:
                             order_book = data.get("order_book", {})
@@ -820,8 +812,7 @@ class VariationalToLighterRuntime:
                                     self.update_lighter_order_book("asks", order_book.get("asks", []))
                                     self.lighter_order_book_offset = new_offset
                                     self._refresh_lighter_best_locked()
-                            await self.evaluate_signal_now()
-                            await self._trigger_close_on_book_tick()
+                            await self.on_market_update()
 
                         elif msg_type == "update/account_orders":
                             orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
@@ -1009,7 +1000,7 @@ class VariationalToLighterRuntime:
         async with self.runtime.monitor._lock:
             self.runtime.monitor._update_quote(parsed)
             self.runtime.monitor.last_update_at = utc_now()
-        await self.evaluate_signal_now()
+        await self.on_market_update()
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
@@ -1033,145 +1024,89 @@ class VariationalToLighterRuntime:
             return "-"
         return f"{value:.4f}%"
 
-    def _fmt_signal_pct(
-        self,
-        current: Decimal | None,
-        book_spread_baseline: Decimal | None,
-        median_5m: float | None,
-        median_30m: float | None,
-        median_1h: float | None,
-    ) -> str:
-        if current is None:
-            return "-"
-        if book_spread_baseline is None:
-            color = "red"
-            return f"[{color}]{self._fmt_pct(current)}[/{color}]"
-
-        adjusted = current - book_spread_baseline
-        adjusted_f = float(adjusted)
-        thresholds = [v for v in (median_5m, median_30m, median_1h) if v is not None]
-        is_green = any(adjusted_f > threshold for threshold in thresholds)
-        color = "green" if is_green else "red"
-        return f"[{color}]{self._fmt_pct(current)}[/{color}]"
-
     @staticmethod
-    def _fill_diff_by_cycle_direction(
-        direction: str,
+    def _fill_diff_short_var(
         var_fill_price: Decimal | None,
         lighter_fill_price: Decimal | None,
     ) -> tuple[Decimal | None, Decimal | None]:
-        if direction == "long_var_short_lighter":
-            # Long Var / Short Lighter: lighter_fill - var_fill
-            diff = spread_value(var_fill_price, lighter_fill_price)
-            pct = spread_percent(diff, var_fill_price)
-            return diff, pct
-        # short_var_long_lighter: var_fill - lighter_fill
+        """Every cycle is short_var/long_lighter: realized edge per unit =
+        var_sell_px - lighter_buy_px, normalised by Lighter's price."""
         diff = spread_value(lighter_fill_price, var_fill_price)
         pct = spread_percent(diff, lighter_fill_price)
         return diff, pct
 
-    @staticmethod
-    def _cycle_direction_labels(direction: str) -> tuple[str, str]:
-        if direction == "long_var_short_lighter":
-            return "做多 Var / 做空 Lighter", "Long Var / Short Lighter"
-        if direction == "short_var_long_lighter":
-            return "做空 Var / 做多 Lighter", "Short Var / Long Lighter"
-        return direction, direction
-
-    @staticmethod
-    def _decimal_as_float(value: Decimal | None) -> float | None:
-        if value is None:
-            return None
-        return float(value)
-
-    @staticmethod
-    def _fmt_median_pct(value: float | None) -> str:
-        if value is None:
-            return "-"
-        return f"{value:.4f}%"
-
-    def _emit_signal_edge(self, direction: str, state, event: str) -> None:
-        direction_state = state.long_direction if direction == "long_var_short_lighter" else state.short_direction
-        self.signal_journal.emit(
+    def _emit_market_tick(self, state: MarketState) -> None:
+        """Log a per-tick snapshot to market_ticks.jsonl for later analysis.
+        Throttled to MARKET_TICK_LOG_MIN_INTERVAL_SECONDS to cap file size."""
+        now_mono = time.monotonic()
+        if (now_mono - self._last_market_tick_log_mono) < MARKET_TICK_LOG_MIN_INTERVAL_SECONDS:
+            return
+        self._last_market_tick_log_mono = now_mono
+        self.market_ticks_journal.emit(
             {
                 "ts": utc_now(),
-                "event": event,
-                "direction": direction,
                 "asset": state.asset,
-                "adjusted_pct": decimal_to_str(direction_state.adjusted_pct),
-                "cross_spread_pct": decimal_to_str(direction_state.cross_spread_pct),
-                "book_spread_baseline_pct": decimal_to_str(state.book_spread_baseline_pct),
-                "median_5m_pct": direction_state.median_5m_pct,
-                "median_30m_pct": direction_state.median_30m_pct,
-                "median_1h_pct": direction_state.median_1h_pct,
-                "quotes": {
-                    "var_bid": decimal_to_str(state.var_bid),
-                    "var_ask": decimal_to_str(state.var_ask),
-                    "lighter_bid": decimal_to_str(state.lighter_bid),
-                    "lighter_ask": decimal_to_str(state.lighter_ask),
-                },
-                "triggered_cycle_id": None,
-                "skip_reason": None,
+                "premium_bp": state.premium_bp,
+                "var_bid": decimal_to_str(state.var_bid),
+                "var_ask": decimal_to_str(state.var_ask),
+                "lighter_bid": decimal_to_str(state.lighter_bid),
+                "lighter_ask": decimal_to_str(state.lighter_ask),
+                "lighter_bid_qty": decimal_to_str(state.lighter_bid_qty),
+                "lighter_ask_qty": decimal_to_str(state.lighter_ask_qty),
             }
         )
 
-    async def evaluate_signal_now(self) -> None:
-        """Event-driven signal evaluation.
+    async def on_market_update(self) -> None:
+        """Event-driven strategy evaluation.
 
         Called from (a) var_poll_loop after each fresh indicative and (b) the
-        Lighter WS book handler after each best-bid/ask change. These are the
-        two MarketUpdate sources — together they drive the only signal path.
-        The dashboard used to re-run record/detect_edges on a 1Hz tick; that
-        delay is gone.
+        Lighter WS book handler after each best-bid/ask change. Builds a
+        MarketState snapshot, caches it for the dashboard, logs the tick,
+        and dispatches to AutoTrader which runs the open/close decision.
         """
-        async with self._signal_eval_lock:
+        async with self._market_update_lock:
             var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
             lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
-            state = self.signal_engine.record(
+            async with self.lighter_order_book_lock:
+                lb_qty = self.lighter_best_bid_qty
+                la_qty = self.lighter_best_ask_qty
+            state = build_market_state(
                 asset=quote_asset or self.variational_ticker,
                 var_bid=var_bid,
                 var_ask=var_ask,
                 lighter_bid=lighter_bid,
                 lighter_ask=lighter_ask,
+                lighter_bid_qty=lb_qty,
+                lighter_ask_qty=la_qty,
             )
-            for direction, event in self.signal_engine.detect_edges():
-                self._emit_signal_edge(direction, state, event=event)
-                if event == "signal_turned_green" and self.auto_trader is not None:
-                    asyncio.create_task(self.auto_trader.on_green_edge(direction, state))
+            self.latest_market_state = state
+            self._emit_market_tick(state)
+            if self.auto_trader is not None:
+                await self.auto_trader.on_market_update(state)
 
     async def render_dashboard(self) -> Group:
         var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
 
-        # Read-only: signal eval runs event-driven via evaluate_signal_now().
-        # At startup, before the first MarketUpdate lands, state is None —
-        # fall back to a one-shot record so the dashboard can display
-        # something on first paint.
-        state = self.signal_engine.get_state()
-        if state is None:
-            state = self.signal_engine.record(
-                asset=quote_asset or self.variational_ticker,
-                var_bid=var_bid,
-                var_ask=var_ask,
-                lighter_bid=lighter_bid,
-                lighter_ask=lighter_ask,
-            )
+        # Read-only snapshot of last MarketState built by on_market_update.
+        # Before the first tick lands, premium and state are still None and
+        # we display "-" gracefully.
+        state = self.latest_market_state
+        premium_bp = state.premium_bp if state is not None else None
 
         var_book_spread = spread_value(var_bid, var_ask)
         lighter_book_spread = spread_value(lighter_bid, lighter_ask)
-        var_book_spread_pct = state.var_book_spread_pct
-        lighter_book_spread_pct = state.lighter_book_spread_pct
-        spread_color_baseline = state.book_spread_baseline_pct
 
-        long_var_short_lighter_pct = state.long_direction.cross_spread_pct
-        short_var_long_lighter_pct = state.short_direction.cross_spread_pct
+        def _book_pct(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
+            if bid is None or ask is None:
+                return None
+            mid = (bid + ask) / Decimal("2")
+            if mid == 0:
+                return None
+            return ((ask - bid) / mid) * Decimal("100")
 
-        long_pct_median_5m = state.long_direction.median_5m_pct
-        long_pct_median_30m = state.long_direction.median_30m_pct
-        long_pct_median_1h = state.long_direction.median_1h_pct
-        short_pct_median_5m = state.short_direction.median_5m_pct
-        short_pct_median_30m = state.short_direction.median_30m_pct
-        short_pct_median_1h = state.short_direction.median_1h_pct
+        var_book_spread_pct = _book_pct(var_bid, var_ask)
+        lighter_book_spread_pct = _book_pct(lighter_bid, lighter_ask)
 
         rows = (
             self.auto_trader.get_recent_cycles(DASHBOARD_ORDERS)
@@ -1189,15 +1124,11 @@ class VariationalToLighterRuntime:
         col_ask = "卖一" if is_zh else "Ask"
         col_book_spread = "买卖价差" if is_zh else "Bid/Ask Spread"
         col_book_spread_pct = "买卖价差%" if is_zh else "Bid/Ask Spread %"
-        spread_title = "价差" if is_zh else "Spreads"
+        premium_title = "Var 溢价信号" if is_zh else "Var Premium Signal"
         col_metric = "指标" if is_zh else "Metric"
-        col_formula = "公式" if is_zh else "Formula"
-        col_value_pct = "当前值%" if is_zh else "Value %"
-        col_median_5m_pct = "5分钟中位数%" if is_zh else "Median 5m %"
-        col_median_30m_pct = "30分钟中位数%" if is_zh else "Median 30m %"
-        col_median_1h_pct = "1小时中位数%" if is_zh else "Median 1h %"
-        metric_long_short = "做多 Var / 做空 Lighter" if is_zh else "Long Var / Short Lighter"
-        metric_short_long = "做空 Var / 做多 Lighter" if is_zh else "Short Var / Long Lighter"
+        col_value = "当前" if is_zh else "Value"
+        col_threshold = "阈值" if is_zh else "Threshold"
+        col_state = "状态" if is_zh else "State"
         orders_title = "最近订单（最新在前）" if is_zh else "Recent Orders (latest first)"
         col_trade_id = "订单ID" if is_zh else "Trade ID"
         col_side = "方向" if is_zh else "Side"
@@ -1239,40 +1170,44 @@ class VariationalToLighterRuntime:
             self._fmt_pct(lighter_book_spread_pct),
         )
 
-        spread_table = Table(title=spread_title, show_header=True, expand=True)
+        # Premium + thresholds + position state in one panel.
+        cfg = self.auto_trader_config
+        if self.auto_trader is not None:
+            var_pos = self.auto_trader._var_pos_qty
+            lig_pos = self.auto_trader._lighter_pos_qty
+            if var_pos == 0 and lig_pos == 0:
+                pos_state = "flat"
+                pos_color = "cyan"
+            else:
+                pos_state = f"var={var_pos} lighter={lig_pos}"
+                pos_color = "yellow"
+        else:
+            pos_state, pos_color = "-", "cyan"
+
+        def _fmt_bp(v: float | None) -> str:
+            return "-" if v is None else f"{v:+.2f}bp"
+
+        def _fmt_premium(v: float | None) -> str:
+            if v is None:
+                return "-"
+            if v > cfg.open_bp:
+                color = "green"
+            elif v < cfg.close_bp:
+                color = "blue"
+            else:
+                color = "white"
+            return f"[{color}]{v:+.2f}bp[/{color}]"
+
+        spread_table = Table(title=premium_title, show_header=True, expand=True)
         spread_table.add_column(col_metric, style="bold")
-        spread_table.add_column(col_formula)
-        spread_table.add_column(col_value_pct, justify="right")
-        spread_table.add_column(col_median_5m_pct, justify="right")
-        spread_table.add_column(col_median_30m_pct, justify="right")
-        spread_table.add_column(col_median_1h_pct, justify="right")
+        spread_table.add_column(col_value, justify="right")
+        spread_table.add_column(col_threshold, justify="right")
+        spread_table.add_column(col_state)
         spread_table.add_row(
-            metric_long_short,
-            "lighter_bid - var_ask",
-            self._fmt_signal_pct(
-                long_var_short_lighter_pct,
-                spread_color_baseline,
-                long_pct_median_5m,
-                long_pct_median_30m,
-                long_pct_median_1h,
-            ),
-            self._fmt_median_pct(long_pct_median_5m),
-            self._fmt_median_pct(long_pct_median_30m),
-            self._fmt_median_pct(long_pct_median_1h),
-        )
-        spread_table.add_row(
-            metric_short_long,
-            "var_bid - lighter_ask",
-            self._fmt_signal_pct(
-                short_var_long_lighter_pct,
-                spread_color_baseline,
-                short_pct_median_5m,
-                short_pct_median_30m,
-                short_pct_median_1h,
-            ),
-            self._fmt_median_pct(short_pct_median_5m),
-            self._fmt_median_pct(short_pct_median_30m),
-            self._fmt_median_pct(short_pct_median_1h),
+            "premium = (var_bid - lighter_ask) / lighter_ask",
+            _fmt_premium(premium_bp),
+            f"open > {cfg.open_bp:.2f}bp | close < {cfg.close_bp:.2f}bp",
+            f"[{pos_color}]{pos_state}[/{pos_color}]",
         )
 
         orders_table = Table(title=orders_title, show_header=True, expand=True)
@@ -1302,11 +1237,10 @@ class VariationalToLighterRuntime:
                 )
                 var_px = cycle.var_leg.avg_fill_px
                 lig_px = cycle.lighter_leg.avg_fill_px
-                fill_diff, fill_diff_pct = self._fill_diff_by_cycle_direction(
-                    cycle.direction, var_px, lig_px,
+                fill_diff, fill_diff_pct = self._fill_diff_short_var(var_px, lig_px)
+                side_display = (
+                    "做空 Var / 做多 Lighter" if is_zh else "Short Var / Long Lighter"
                 )
-                side_zh, side_en = self._cycle_direction_labels(cycle.direction)
-                side_display = side_zh if is_zh else side_en
                 orders_table.add_row(
                     trade_display,
                     side_display,
@@ -1320,7 +1254,7 @@ class VariationalToLighterRuntime:
         stats = self.auto_trader.snapshot() if self.auto_trader is not None else None
         if stats is not None:
             dropped = (
-                self.signal_journal.dropped_count
+                self.market_ticks_journal.dropped_count
                 + self.events_journal.dropped_count
                 + self.cycles_journal.dropped_count
             )
@@ -1439,19 +1373,14 @@ class VariationalToLighterRuntime:
         for cycle in cycles:
             var_px = cycle.var_leg.avg_fill_px
             lig_px = cycle.lighter_leg.avg_fill_px
-            fill_diff, fill_diff_pct = self._fill_diff_by_cycle_direction(
-                cycle.direction, var_px, lig_px,
-            )
-            side_zh, side_en = self._cycle_direction_labels(cycle.direction)
+            fill_diff, fill_diff_pct = self._fill_diff_short_var(var_px, lig_px)
             rows.append(
                 {
                     "cycle_id": cycle.cycle_id,
                     "opened_at": cycle.opened_at,
                     "closed_at": cycle.closed_at,
                     "asset": cycle.asset,
-                    "direction": cycle.direction,
-                    "direction_zh": side_zh,
-                    "direction_en": side_en,
+                    "entry_premium_bp": cycle.entry_premium_bp,
                     "status": cycle.status,
                     "qty_target": decimal_to_str(cycle.var_leg.requested_qty),
                     "var_rfq_id": cycle.var_leg.rfq_id,
@@ -1481,9 +1410,7 @@ class VariationalToLighterRuntime:
             "opened_at",
             "closed_at",
             "asset",
-            "direction",
-            "direction_zh",
-            "direction_en",
+            "entry_premium_bp",
             "status",
             "qty_target",
             "var_rfq_id",
@@ -1543,16 +1470,18 @@ class VariationalToLighterRuntime:
 
     async def run(self) -> None:
         self.logger.info(
-            "Startup config: qty=%s throttle_s=%.1f max_trades/day=%d "
-            "leg_timeout_s=%.1f var_order_timeout_ms=%d lang=%s",
-            self.auto_trader_config.qty, self.auto_trader_config.throttle_seconds,
+            "Startup config: qty=%s open_bp=%.2f close_bp=%.2f throttle_s=%.1f "
+            "max_trades/day=%d leg_timeout_s=%.1f var_order_timeout_ms=%d lang=%s",
+            self.auto_trader_config.qty,
+            self.auto_trader_config.open_bp, self.auto_trader_config.close_bp,
+            self.auto_trader_config.throttle_seconds,
             self.auto_trader_config.max_trades_per_day,
             self.auto_trader_config.leg_settle_timeout_sec,
             self.auto_trader_config.var_order_timeout_ms, self.args.lang,
         )
         self.setup_signal_handlers()
         await self.runtime.start()
-        await self.signal_journal.start()
+        await self.market_ticks_journal.start()
         await self.events_journal.start()
         await self.cycles_journal.start()
         self.print_startup_next_steps()
@@ -1585,7 +1514,6 @@ class VariationalToLighterRuntime:
         )
         lighter_adapter = LighterAdapterImpl(self)
         self.auto_trader = AutoTrader(
-            signal=self.signal_engine,
             var_placer=var_placer,
             lighter=lighter_adapter,
             config=self.auto_trader_config,
@@ -1594,10 +1522,12 @@ class VariationalToLighterRuntime:
             logger=self.logger,
         )
         self.logger.info(
-            "AutoTrader initialized: qty=%s throttle=%.1fs max/day=%d position_limit=%s",
-            self.auto_trader_config.qty, self.auto_trader_config.throttle_seconds,
+            "AutoTrader initialized: qty=%s open_bp=%.2f close_bp=%.2f throttle=%.1fs max/day=%d",
+            self.auto_trader_config.qty,
+            self.auto_trader_config.open_bp,
+            self.auto_trader_config.close_bp,
+            self.auto_trader_config.throttle_seconds,
             self.auto_trader_config.max_trades_per_day,
-            self.auto_trader_config.position_limit,
         )
 
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
@@ -1634,7 +1564,7 @@ class VariationalToLighterRuntime:
             self.lighter_ws_task.cancel()
             await asyncio.gather(self.lighter_ws_task, return_exceptions=True)
 
-        await self.signal_journal.stop()
+        await self.market_ticks_journal.stop()
         await self.events_journal.stop()
         await self.cycles_journal.stop()
         if self.cmd_client is not None:
@@ -1656,12 +1586,14 @@ def parse_args() -> argparse.Namespace:
         description="Cross-venue spread trader. Auto-triggers on green-light signal; writes per-cycle P&L attribution."
     )
     parser.add_argument("--qty", required=True, type=str, help="Per-cycle base asset qty (required). Example: 0.01")
-    parser.add_argument("--throttle-seconds", type=float, default=3.0)
+    parser.add_argument("--open-bp", type=float, default=8.0,
+                        help="Fire a new short-var/long-lighter cycle when the Var premium "
+                             "exceeds this (in bp). Target per-cycle edge before slippage = open_bp - close_bp.")
+    parser.add_argument("--close-bp", type=float, default=1.0,
+                        help="Unwind the current cycle when the Var premium drops below this (in bp).")
+    parser.add_argument("--throttle-seconds", type=float, default=1.0,
+                        help="Minimum gap between consecutive open-cycle fires. Smooths premium oscillation.")
     parser.add_argument("--max-trades-per-day", type=int, default=200)
-    parser.add_argument("--position-limit", type=str, default="0",
-                        help="Per-venue position ceiling (unsigned qty). At |pos|>=limit "
-                             "on either venue we enter reduce-only mode and stay there "
-                             "until BOTH venues are flat. 0 means auto-derive as 2x qty.")
     parser.add_argument("--var-order-timeout-ms", type=int, default=5000)
     parser.add_argument("--leg-settle-timeout-sec", type=float, default=10.0)
     parser.add_argument("--debug-var-payload", action="store_true",
