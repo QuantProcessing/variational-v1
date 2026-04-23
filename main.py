@@ -1134,15 +1134,15 @@ class VariationalToLighterRuntime:
         col_threshold = "阈值" if is_zh else "Threshold"
         col_state = "状态" if is_zh else "State"
         orders_title = "最近订单（最新在前）" if is_zh else "Recent Orders (latest first)"
-        col_trade_id = "订单ID" if is_zh else "Trade ID"
+        col_trade_id = "订单" if is_zh else "Trade"
         col_qty = "数量" if is_zh else "Qty"
-        col_var_open = "Var 开" if is_zh else "Var Open"
-        col_var_close = "Var 平" if is_zh else "Var Close"
-        col_lig_open = "Lighter 开" if is_zh else "Lighter Open"
-        col_lig_close = "Lighter 平" if is_zh else "Lighter Close"
-        col_entry_bp = "开 bp" if is_zh else "Entry bp"
-        col_exit_bp = "平 bp" if is_zh else "Exit bp"
-        col_rt_pnl_bp = "RT PnL bp" if is_zh else "RT PnL bp"
+        col_var_open = "var 开" if is_zh else "var open"
+        col_var_close = "var 平" if is_zh else "var close"
+        col_lit_open = "lit 开" if is_zh else "lit open"
+        col_lit_close = "lit 平" if is_zh else "lit close"
+        col_open_bp = "开 bp (信号/实际)" if is_zh else "open bp (sig/real)"
+        col_close_bp = "平 bp (信号/实际)" if is_zh else "close bp (sig/real)"
+        col_pnl_bp = "PnL bp" if is_zh else "PnL bp"
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
         variational_label = "Variational"
         lighter_label = "Lighter"
@@ -1216,19 +1216,31 @@ class VariationalToLighterRuntime:
             f"[{pos_color}]{pos_state}[/{pos_color}]",
         )
 
+        # Column order: trade | qty | var_open | lit_open | open_bp | var_close | lit_close | close_bp | pnl_bp
+        # Open/close bp are shown as "signal/actual" — (signal − actual)
+        # reveals per-leg slippage at a glance.
         orders_table = Table(title=orders_title, show_header=True, expand=True)
         orders_table.add_column(col_trade_id)
         orders_table.add_column(col_qty, justify="right")
         orders_table.add_column(col_var_open, justify="right")
+        orders_table.add_column(col_lit_open, justify="right")
+        orders_table.add_column(col_open_bp, justify="right")
         orders_table.add_column(col_var_close, justify="right")
-        orders_table.add_column(col_lig_open, justify="right")
-        orders_table.add_column(col_lig_close, justify="right")
-        orders_table.add_column(col_entry_bp, justify="right")
-        orders_table.add_column(col_exit_bp, justify="right")
-        orders_table.add_column(col_rt_pnl_bp, justify="right")
+        orders_table.add_column(col_lit_close, justify="right")
+        orders_table.add_column(col_close_bp, justify="right")
+        orders_table.add_column(col_pnl_bp, justify="right")
 
-        def _fmt_signed_bp(v):
-            return "-" if v is None else f"{v:+.2f}"
+        def _actual_bp(var_px, lit_px):
+            """(var − lit)/lit × 1e4, used for both open and close legs.
+            Directly comparable to signal premium_bp (same formula)."""
+            if var_px is None or lit_px is None or lit_px == 0:
+                return None
+            return float((var_px - lit_px) / lit_px) * 10000.0
+
+        def _fmt_sig_act(signal, actual):
+            s = f"{signal:+.2f}" if signal is not None else "-"
+            a = f"{actual:+.2f}" if actual is not None else "-"
+            return f"{s}/{a}"
 
         def _fmt_pnl_bp(v):
             if v is None:
@@ -1244,15 +1256,17 @@ class VariationalToLighterRuntime:
                     cycle.var_leg.trade_id[:10] if cycle.var_leg.trade_id
                     else cycle.cycle_id[-10:]
                 )
+                open_actual = _actual_bp(cycle.var_leg.avg_fill_px, cycle.lighter_leg.avg_fill_px)
+                close_actual = _actual_bp(cycle.close.var_avg_fill_px, cycle.close.lighter_avg_fill_px)
                 orders_table.add_row(
                     trade_display,
                     self._fmt_price(cycle.var_leg.requested_qty),
                     self._fmt_price(cycle.var_leg.avg_fill_px),
-                    self._fmt_price(cycle.close.var_avg_fill_px),
                     self._fmt_price(cycle.lighter_leg.avg_fill_px),
+                    _fmt_sig_act(cycle.entry_premium_bp, open_actual),
+                    self._fmt_price(cycle.close.var_avg_fill_px),
                     self._fmt_price(cycle.close.lighter_avg_fill_px),
-                    _fmt_signed_bp(cycle.entry_premium_bp),
-                    _fmt_signed_bp(cycle.close.exit_premium_bp),
+                    _fmt_sig_act(cycle.close.exit_premium_bp, close_actual),
                     _fmt_pnl_bp(cycle.close.round_trip_pnl_bp),
                 )
 

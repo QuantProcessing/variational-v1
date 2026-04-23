@@ -840,15 +840,25 @@ class AutoTrader:
                          else getattr(lig_res, "error", None))
 
             # Close Var's trade_id is the close rfq_id — stash on active cycle
-            # so on_variational_fill can route the close fill back.
+            # so on_variational_fill can route the close fill back. Var /events
+            # WS can push the fill BEFORE this HTTP response lands (observed
+            # ~100ms early), in which case the fill is already waiting in
+            # _pending_var_fills keyed on this rfq_id — drain it now.
             var_trade_id = (
                 None if isinstance(var_res, Exception)
                 else getattr(var_res, "trade_id", None)
             )
+            buffered_close: list[tuple[Decimal, Decimal, str | None, float]] = []
             if active is not None and var_trade_id:
                 async with self._lock:
-                    if var_trade_id not in active.close.var_rfq_ids:
-                        active.close.var_rfq_ids.append(str(var_trade_id))
+                    rfq_str = str(var_trade_id)
+                    if rfq_str not in active.close.var_rfq_ids:
+                        active.close.var_rfq_ids.append(rfq_str)
+                    buffered_close = self._pending_var_fills.pop(rfq_str, None) or []
+            if active is not None and buffered_close:
+                for fill_px, fill_qty, _tid, _ts in buffered_close:
+                    self._apply_close_var_fill(active, fill_px, fill_qty)
+                await self._maybe_finalize_round_trip(active)
 
             self.events.emit({
                 "ts": _utc_now_iso(), "event": "close_ack",
