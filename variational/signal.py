@@ -26,9 +26,24 @@ def compute_premium_bp(
     var_bid: Decimal | None,
     lighter_ask: Decimal | None,
 ) -> float | None:
+    """Open-executable premium: per-unit edge captured by short-var/long-lighter
+    at the touch. Positive when Var bid sits above Lighter ask."""
     if var_bid is None or lighter_ask is None or lighter_ask == 0:
         return None
     return float((var_bid - lighter_ask) / lighter_ask) * 10000.0
+
+
+def compute_close_premium_bp(
+    lighter_bid: Decimal | None,
+    var_ask: Decimal | None,
+) -> float | None:
+    """Close-executable premium: per-unit cash flow from unwinding (sell
+    lighter at its bid, buy var at its ask). Typically negative — we pay
+    venue_spreads to cross out. Only positive under deep inversion where
+    lit_bid > var_ask. This is the right gate for the close decision."""
+    if lighter_bid is None or var_ask is None or lighter_bid == 0:
+        return None
+    return float((lighter_bid - var_ask) / lighter_bid) * 10000.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +57,8 @@ class MarketState:
     lighter_ask: Decimal | None
     lighter_bid_qty: Decimal | None
     lighter_ask_qty: Decimal | None
-    premium_bp: float | None
+    premium_bp: float | None       # open gate: (var_bid - lit_ask) / lit_ask
+    close_premium_bp: float | None  # close gate: (lit_bid - var_ask) / lit_bid
 
 
 def build_market_state(
@@ -65,4 +81,5 @@ def build_market_state(
         lighter_bid_qty=lighter_bid_qty,
         lighter_ask_qty=lighter_ask_qty,
         premium_bp=compute_premium_bp(var_bid, lighter_ask),
+        close_premium_bp=compute_close_premium_bp(lighter_bid, var_ask),
     )

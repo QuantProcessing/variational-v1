@@ -1198,11 +1198,17 @@ class VariationalToLighterRuntime:
                 return "-"
             if v > cfg.open_bp:
                 color = "green"
-            elif v < cfg.close_bp:
-                color = "blue"
             else:
                 color = "white"
             return f"[{color}]{v:+.2f}bp[/{color}]"
+
+        def _fmt_close_premium(v: float | None) -> str:
+            if v is None:
+                return "-"
+            color = "green" if v > cfg.close_bp else "white"
+            return f"[{color}]{v:+.2f}bp[/{color}]"
+
+        close_premium_bp = state.close_premium_bp if state is not None else None
 
         spread_table = Table(title=premium_title, show_header=True, expand=True)
         spread_table.add_column(col_metric, style="bold")
@@ -1210,10 +1216,16 @@ class VariationalToLighterRuntime:
         spread_table.add_column(col_threshold, justify="right")
         spread_table.add_column(col_state)
         spread_table.add_row(
-            "premium = (var_bid - lighter_ask) / lighter_ask",
+            "open premium = (var_bid - lit_ask) / lit_ask",
             _fmt_premium(premium_bp),
-            f"open > {cfg.open_bp:.2f}bp | close < {cfg.close_bp:.2f}bp",
+            f"open > {cfg.open_bp:+.2f}bp",
             f"[{pos_color}]{pos_state}[/{pos_color}]",
+        )
+        spread_table.add_row(
+            "close premium = (lit_bid - var_ask) / lit_bid",
+            _fmt_close_premium(close_premium_bp),
+            f"close > {cfg.close_bp:+.2f}bp",
+            "",
         )
 
         # Column order: trade | qty | var_open | lit_open | open_bp | var_close | lit_close | close_bp | pnl_bp
@@ -1230,12 +1242,20 @@ class VariationalToLighterRuntime:
         orders_table.add_column(col_close_bp, justify="right")
         orders_table.add_column(col_pnl_bp, justify="right")
 
-        def _actual_bp(var_px, lit_px):
-            """(var − lit)/lit × 1e4, used for both open and close legs.
-            Directly comparable to signal premium_bp (same formula)."""
+        def _actual_open_bp(var_px, lit_px):
+            """(var_sell_fill − lit_buy_fill)/lit_buy_fill × 1e4. Matches
+            the open signal formula so signal − actual = open slippage."""
             if var_px is None or lit_px is None or lit_px == 0:
                 return None
             return float((var_px - lit_px) / lit_px) * 10000.0
+
+        def _actual_close_bp(var_px, lit_px):
+            """(lit_sell_fill − var_buy_fill)/lit_sell_fill × 1e4. Matches
+            the close signal formula (lit_bid - var_ask)/lit_bid so
+            signal − actual = close slippage."""
+            if var_px is None or lit_px is None or lit_px == 0:
+                return None
+            return float((lit_px - var_px) / lit_px) * 10000.0
 
         def _fmt_sig_act(signal, actual):
             s = f"{signal:+.2f}" if signal is not None else "-"
@@ -1256,8 +1276,8 @@ class VariationalToLighterRuntime:
                     cycle.var_leg.trade_id[:10] if cycle.var_leg.trade_id
                     else cycle.cycle_id[-10:]
                 )
-                open_actual = _actual_bp(cycle.var_leg.avg_fill_px, cycle.lighter_leg.avg_fill_px)
-                close_actual = _actual_bp(cycle.close.var_avg_fill_px, cycle.close.lighter_avg_fill_px)
+                open_actual = _actual_open_bp(cycle.var_leg.avg_fill_px, cycle.lighter_leg.avg_fill_px)
+                close_actual = _actual_close_bp(cycle.close.var_avg_fill_px, cycle.close.lighter_avg_fill_px)
                 orders_table.add_row(
                     trade_display,
                     self._fmt_price(cycle.var_leg.requested_qty),
@@ -1611,10 +1631,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--qty", required=True, type=str, help="Per-cycle base asset qty (required). Example: 0.01")
     parser.add_argument("--open-bp", type=float, default=8.0,
-                        help="Fire a new short-var/long-lighter cycle when the Var premium "
-                             "exceeds this (in bp). Target per-cycle edge before slippage = open_bp - close_bp.")
-    parser.add_argument("--close-bp", type=float, default=1.0,
-                        help="Unwind the current cycle when the Var premium drops below this (in bp).")
+                        help="Open a cycle when open premium (var_bid - lit_ask)/lit_ask exceeds this (bp).")
+    parser.add_argument("--close-bp", type=float, default=0.0,
+                        help="Close the cycle when close premium (lit_bid - var_ask)/lit_bid exceeds this (bp). "
+                             "Default 0 means 'close only when the unwind is free or profitable'. "
+                             "Typical range: -5 (lenient) to +1 (strict). Typically negative because the close "
+                             "metric is bounded above by -venue_spreads.")
     parser.add_argument("--throttle-seconds", type=float, default=1.0,
                         help="Minimum gap between consecutive open-cycle fires. Smooths premium oscillation.")
     parser.add_argument("--max-trades-per-day", type=int, default=200)

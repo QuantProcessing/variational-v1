@@ -68,11 +68,13 @@ def _dec_str(value: Decimal | None) -> str | None:
 class AutoTraderConfig:
     qty: Decimal
     # Premium band thresholds, in basis points.
-    # open_bp  : fire a new cycle when premium strictly exceeds this.
-    # close_bp : unwind the current cycle when premium drops below this.
-    # Target per-cycle edge (before slippage) = open_bp - close_bp.
+    # open_bp  : open when (var_bid - lit_ask)/lit_ask exceeds this.
+    # close_bp : close when (lit_bid - var_ask)/lit_bid exceeds this.
+    # The two metrics differ by venue_spreads; close_bp is naturally negative
+    # unless the book is inverted. Theoretical per-cycle PnL ≈ open_bp -
+    # close_bp - venue_spreads once you account for the two sides of the spread.
     open_bp: float = 8.0
-    close_bp: float = 1.0
+    close_bp: float = 0.0
     throttle_seconds: float = 1.0
     max_trades_per_day: int = 200
     leg_settle_timeout_sec: float = 10.0
@@ -317,19 +319,26 @@ class AutoTrader:
     async def on_market_update(self, state: MarketState) -> None:
         """Single entry point driven by every MarketUpdate (Lighter WS book
         delta or Var indicative poll). Decides whether to open or close
-        based on current premium and position state."""
-        if state.premium_bp is None:
-            return
+        based on the appropriate executable premium:
+          - Open gate uses premium_bp = (var_bid - lit_ask) / lit_ask
+          - Close gate uses close_premium_bp = (lit_bid - var_ask) / lit_bid
+        These two formulas are NOT equivalent — they differ by venue_spreads
+        — and the right gate must match the side we're executing on.
+        """
         self._maybe_rollover()
         if self.stats.frozen:
             return
 
         flat = self._is_flat()
         if flat:
+            if state.premium_bp is None:
+                return
             if state.premium_bp > self.config.open_bp:
                 await self._try_open(state)
         else:
-            if state.premium_bp < self.config.close_bp:
+            if state.close_premium_bp is None:
+                return
+            if state.close_premium_bp > self.config.close_bp:
                 await self._try_close(state)
 
     def snapshot(self) -> TraderStats:
@@ -776,7 +785,7 @@ class AutoTrader:
             asset=state.asset or "", qty=close_qty,
             var_side=var_side, lighter_side=lighter_side,
             lighter_bid=state.lighter_bid, lighter_ask=state.lighter_ask,
-            exit_premium_bp=state.premium_bp,
+            exit_premium_bp=state.close_premium_bp,
         ))
 
     async def _execute_close(
